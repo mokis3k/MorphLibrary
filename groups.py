@@ -1,12 +1,18 @@
 import bpy
-from bpy.types import Operator, PropertyGroup, UIList, Menu
+from bpy.types import (
+    Operator,
+    PropertyGroup,
+    UIList,
+    Menu,
+)
 from bpy.props import (
     BoolProperty,
     IntProperty,
     StringProperty,
     FloatProperty,
-    CollectionProperty,
 )
+
+from .transfer import TransferModalMixin
 
 from .common import (
     INIT_GROUP_NAME,
@@ -17,9 +23,7 @@ from .common import (
     get_fallback_group_name,
     is_initialized,
     get_selected_group_name,
-    enum_groups_for_active_object,
     tag_redraw_view3d,
-    parse_tokens,
     clear_selection_ui,
     kd_get_group,
     kd_set_group,
@@ -29,13 +33,16 @@ from .common import (
     kd_clear_selected,
     count_keys_in_group,
     ensure_init_setup_write,
-    skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
     kd_group_map,
     kd_autokf_get_entry as _autokf_get_entry,
     kd_favorite_names,
     skv_list_key_names,
     kd_activate_selection_source,
+    skv_shape_key_filter_flags,
+    SKV_ROW_SELECTED,
+    SKV_ROW_FAVORITE,
+    SKV_ROW_AUTO_KEYFRAME,
 )
 
 
@@ -182,50 +189,6 @@ def _remove_empty_transfer_fallback_group(target_key_data) -> None:
             target_key_data.skv_last_group_index = int(target_key_data.skv_group_index)
     except Exception:
         pass
-
-
-def _remove_existing_target_shape_keys(target_obj, key_names) -> int:
-    # Remove target shape keys with names matching transferred keys.
-    if not target_obj or getattr(target_obj, "type", None) != "MESH":
-        return 0
-
-    target_key_data = get_shape_key_data(target_obj)
-    if not target_key_data or not getattr(target_key_data, "key_blocks", None):
-        return 0
-
-    if getattr(target_key_data, "library", None) is not None:
-        return 0
-
-    names = [n for n in (key_names or []) if n and n != "Basis"]
-    if not names:
-        return 0
-
-    removed = 0
-
-    try:
-        active_index = int(getattr(target_obj, "active_shape_key_index", 0))
-    except Exception:
-        active_index = 0
-
-    for key_name in names:
-        kb = target_key_data.key_blocks.get(key_name)
-        if not kb or kb.name == "Basis":
-            continue
-
-        try:
-            target_obj.shape_key_remove(kb)
-            removed += 1
-        except Exception:
-            continue
-
-    try:
-        target_key_data = get_shape_key_data(target_obj)
-        if target_key_data and getattr(target_key_data, "key_blocks", None):
-            target_obj.active_shape_key_index = min(active_index, len(target_key_data.key_blocks) - 1)
-    except Exception:
-        pass
-
-    return removed
 
 
 # -----------------------------
@@ -700,50 +663,25 @@ class SKV_UL_key_blocks(UIList):
     bl_idname = "SKV_UL_key_blocks"
 
     def filter_items(self, context, data, propname):
-        if not data:
-            return [], []
+        return skv_shape_key_filter_flags(
+            self,
+            context,
+            data,
+            propname,
+        )
 
-        group_name = get_selected_group_name(data)
-        mapping = kd_group_map(data)
-        fallback = get_fallback_group_name(data)
-        tokens = [
-            token.lower()
-            for token in parse_tokens(context.scene.skv_props.search)
-        ]
-
-        flags = []
-        for kb in getattr(data, propname):
-            visible = (
-                    kb.name != "Basis"
-                    and (
-                            not group_name
-                            or mapping.get(kb.name, fallback) == group_name
-                    )
-                    and all(
-                token in kb.name.lower()
-                for token in tokens
-            )
-            )
-            flags.append(
-                self.bitflag_filter_item if visible else 0
-            )
-
-        return flags, []
-
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+    def draw_item(
+            self, context, layout, data, item, icon,
+            active_data, active_propname, index, flt_flag=0,
+    ):
         kb = item
-        key_data = data
         row = layout.row(align=True)
 
         source = {
             "SKV_UL_favorites": "FAVORITES",
             "SKV_UL_keyframed_keys": "KEYFRAMED",
-            "SKV_UL_quick_shape_keys": "QUICK",
         }.get(self.bl_idname, "GROUP")
-        selected = (
-                key_data.skv_selection_source == source
-                and kd_is_selected(key_data, kb.name)
-        )
+        selected = bool(flt_flag & SKV_ROW_SELECTED)
         icon_id = "CHECKBOX_HLT" if selected else "CHECKBOX_DEHLT"
 
         op = row.operator(
@@ -762,7 +700,7 @@ class SKV_UL_key_blocks(UIList):
         opv = row.operator("skv.shape_key_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.key_name = kb.name
 
-        favorite = kb.name in kd_favorite_names(key_data)
+        favorite = bool(flt_flag & SKV_ROW_FAVORITE)
 
         opf = row.operator(
             "skv.favorite_toggle",
@@ -772,8 +710,9 @@ class SKV_UL_key_blocks(UIList):
         )
         opf.key_name = kb.name
 
-        entry = _autokf_get_entry(key_data, kb.name, create=False)
-        kf_enabled = bool(entry.enabled) if entry else False
+        kf_enabled = bool(
+            flt_flag & SKV_ROW_AUTO_KEYFRAME
+        )
         opk = row.operator(
             "skv.auto_keyframe_toggle",
             text="",
@@ -787,29 +726,16 @@ class SKV_UL_favorites(UIList):
     bl_idname = "SKV_UL_favorites"
 
     def filter_items(self, context, data, propname):
-        names = set(
-            skv_list_key_names(
-                data,
-                context.scene.skv_props,
-                "FAVORITES",
-            )
+        return skv_shape_key_filter_flags(
+            self,
+            context,
+            data,
+            propname,
         )
 
-        return [
-            self.bitflag_filter_item if kb.name in names else 0
-            for kb in getattr(data, propname)
-        ], []
-
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon,
+        active_data, active_propname, index, flt_flag=0,
     ):
         SKV_UL_key_blocks.draw_item(
             self,
@@ -821,6 +747,7 @@ class SKV_UL_favorites(UIList):
             active_data,
             active_propname,
             index,
+            flt_flag,
         )
 
 
@@ -952,7 +879,6 @@ class SKV_OT_KeyToggleSelect(Operator):
             "GROUP",
             "FAVORITES",
             "KEYFRAMED",
-            "QUICK",
         }:
             return {"CANCELLED"}
 
@@ -1041,59 +967,6 @@ class SKV_OT_FavoritesSelectVisible(Operator):
     def execute(self, context):
         return _select_visible_from_list(self, context, "FAVORITES")
 
-
-# class SKV_OT_SelectByAffix(Operator):
-#     bl_idname = "skv.select_by_affix"
-#     bl_label = "Select by Affix"
-#     bl_options = {"REGISTER", "UNDO"}
-#
-#     mode: StringProperty(name="Mode", default="PREFIX")
-#
-#     def execute(self, context):
-#         obj = get_active_object(context)
-#         if not obj:
-#             return {"CANCELLED"}
-#
-#         key_data = get_shape_key_data(obj)
-#         if not key_data or not key_data.key_blocks:
-#             return {"CANCELLED"}
-#
-#         if not is_initialized(key_data):
-#             self.report({"INFO"}, "Not initialized.")
-#             return {"CANCELLED"}
-#
-#         props = context.scene.skv_props
-#         text = (props.affix_value or "").strip()
-#         if not text:
-#             self.report({"INFO"}, "Enter prefix/suffix text.")
-#             return {"CANCELLED"}
-#
-#         group_name = get_selected_group_name(key_data)
-#         matched = []
-#
-#         for kb in key_data.key_blocks:
-#             if kb.name == "Basis":
-#                 continue
-#             if kd_get_group(key_data, kb.name) != group_name:
-#                 continue
-#
-#             if self.mode == "PREFIX" and kb.name.startswith(text):
-#                 matched.append(kb.name)
-#             elif self.mode == "SUFFIX" and kb.name.endswith(text):
-#                 matched.append(kb.name)
-#
-#         if not matched:
-#             self.report({"INFO"}, "No matching shape keys.")
-#             return {"CANCELLED"}
-#
-#         for n in matched:
-#             kd_set_selected(key_data, n, True)
-#
-#         props.last_affix_name = text
-#         props.last_affix_pending = True
-#
-#         tag_redraw_view3d(context)
-#         return {"FINISHED"}
 
 class SKV_OT_MoveSelectedToGroup(Operator):
     bl_idname = "skv.move_selected_to_group"
@@ -1273,9 +1146,9 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
                     preset.items_index = -1
 
         props = context.scene.skv_props
-        if props.quick_shape_key_name in deleted:
-            props.quick_shape_key_editing = False
-            props.quick_shape_key_name = ""
+        if props.sculpt_shape_key_name in deleted:
+            props.shape_key_sculpting = False
+            props.sculpt_shape_key_name = ""
 
         # Keep the active key when it survives; otherwise use a nearby key.
         if active_name in deleted or key_data.key_blocks.get(active_name) is None:
@@ -1541,12 +1414,7 @@ class SKV_OT_CreateGroupFromSelected(Operator):
     name: StringProperty(name="Group Name", default="New Group")
 
     def invoke(self, context, event):
-        props = getattr(context.scene, "skv_props", None)
-        if props and props.last_affix_pending and props.last_affix_name.strip():
-            self.name = props.last_affix_name.strip()
-            props.last_affix_pending = False
-        else:
-            self.name = "New Group"
+        self.name = "New Group"
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
@@ -1606,10 +1474,10 @@ class SKV_OT_CreateGroupFromSelected(Operator):
         return {"FINISHED"}
 
 
-class SKV_OT_TransferTo(Operator):
+class SKV_OT_TransferTo(TransferModalMixin, Operator):
     bl_idname = "skv.transfer_to"
     bl_label = "Transfer to"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
 
     def invoke(self, context, event):
         obj = get_active_object(context)
@@ -1619,87 +1487,154 @@ class SKV_OT_TransferTo(Operator):
         context.scene.skv_transfer_source_name = obj.name
 
         tgt = getattr(context.scene, "skv_transfer_target", None)
-        if not tgt or getattr(tgt, "type", None) != "MESH" or tgt.name == obj.name:
+        if (
+            not tgt
+            or getattr(tgt, "type", None) != "MESH"
+            or tgt.name == obj.name
+        ):
             context.scene.skv_transfer_target = None
 
-        return context.window_manager.invoke_props_dialog(self, width=320)
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=320,
+        )
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(context.scene, "skv_transfer_target", text="Target")
-        layout.prop(context.scene.skv_props, "transfer_inheritance", text="Inherit presets")
-        layout.prop(context.scene.skv_props, "transfer_keyframes_inheritance", text="Inherit keyframes")
+
+        layout.prop(
+            context.scene,
+            "skv_transfer_target",
+            text="Target",
+        )
+        layout.prop(
+            context.scene.skv_props,
+            "transfer_inheritance",
+            text="Inherit presets",
+        )
+        layout.prop(
+            context.scene.skv_props,
+            "transfer_keyframes_inheritance",
+            text="Inherit keyframes",
+        )
 
     @classmethod
     def poll(cls, context):
         obj = get_active_object(context)
         if not obj:
             return False
+
         key_data = get_shape_key_data(obj)
         if not key_data or not getattr(key_data, "key_blocks", None):
             return False
-        selected = list(kd_selected_set(key_data))
-        return any(n != "Basis" for n in selected)
+
+        selected = kd_selected_set(key_data)
+        return any(name != "Basis" for name in selected)
 
     def execute(self, context):
         from .transfer import Transfer
-        from . import presets
 
         source = get_active_object(context)
         if not source:
             return {"CANCELLED"}
 
-        target = getattr(context.scene, "skv_transfer_target", None)
+        target = getattr(
+            context.scene,
+            "skv_transfer_target",
+            None,
+        )
         if not target or getattr(target, "type", None) != "MESH":
             self.report({"ERROR"}, "Target mesh is not set")
             return {"CANCELLED"}
 
         if target.name == source.name:
-            self.report({"ERROR"}, "Target must be different from source")
+            self.report(
+                {"ERROR"},
+                "Target must be different from source",
+            )
             return {"CANCELLED"}
 
         key_data = get_shape_key_data(source)
-        selected_names = [n for n in kd_selected_set(key_data) if n != "Basis"]
+        selected_names = [
+            name
+            for name in kd_selected_set(key_data)
+            if name != "Basis"
+        ]
+
         if not selected_names:
             self.report({"ERROR"}, "No selected Shape Keys")
             return {"CANCELLED"}
 
-        _remove_existing_target_shape_keys(target, selected_names)
+        self._job_inherit_presets = bool(
+            context.scene.skv_props.transfer_inheritance
+        )
+        self._job_inherit_keyframes = bool(
+            context.scene.skv_props.transfer_keyframes_inheritance
+        )
 
-        transfer_data = Transfer(source=source, target=target, vertex_group=None)
-        try:
-            ok = transfer_data.transfer_shape_keys(shapekey_names=selected_names)
-        finally:
-            transfer_data.free()
+        transfer_data = Transfer(
+            source=source,
+            target=target,
+            vertex_group=None,
+        )
 
-        if not ok:
-            self.report({"WARNING"}, "Nothing transferred")
-            return {"CANCELLED"}
+        return self._transfer_begin(
+            context,
+            transfer_data,
+            selected_names,
+        )
 
+    def _finish_transfer(self, context):
+        from . import presets
+
+        source = self._job_source
+        target = self._job_target
+        selected_names = self._job_names
+
+        key_data = get_shape_key_data(source)
         target_key_data = get_shape_key_data(target)
-        if target_key_data and getattr(target_key_data, "key_blocks", None):
+
+        if target_key_data and getattr(
+            target_key_data,
+            "key_blocks",
+            None,
+        ):
             for key_name in selected_names:
-                    src_kb = key_data.key_blocks.get(key_name)
-                    dst_kb = target_key_data.key_blocks.get(key_name)
-                    if not src_kb or not dst_kb:
-                        continue
-                    try:
-                        dst_kb.value = float(src_kb.value)
-                    except Exception:
-                        pass
+                src_kb = key_data.key_blocks.get(key_name)
+                dst_kb = target_key_data.key_blocks.get(key_name)
 
-        inherit_transferred_groups(source, target, selected_names)
+                if not src_kb or not dst_kb:
+                    continue
 
-        inherited_count = 0
-        if getattr(context.scene.skv_props, "transfer_inheritance", False):
-            inherited_count = presets.inherit_transferred_keys_to_presets(source, target, selected_names)
+                try:
+                    dst_kb.value = float(src_kb.value)
+                except Exception:
+                    pass
 
-        if getattr(context.scene.skv_props, "transfer_keyframes_inheritance", False):
-            inherit_transferred_keyframes(source, target, selected_names)
+        inherit_transferred_groups(
+            source,
+            target,
+            selected_names,
+        )
+
+        if self._job_inherit_presets:
+            presets.inherit_transferred_keys_to_presets(
+                source,
+                target,
+                selected_names,
+            )
+
+        if self._job_inherit_keyframes:
+            inherit_transferred_keyframes(
+                source,
+                target,
+                selected_names,
+            )
 
         clear_selection_ui(context, key_data)
 
         view_layer = context.view_layer
+
         try:
             for ob in list(view_layer.objects):
                 if ob.select_get():
@@ -1718,11 +1653,10 @@ class SKV_OT_TransferTo(Operator):
         return {"FINISHED"}
 
 
-
-class SKV_OT_TransferFrom(Operator):
+class SKV_OT_TransferFrom(TransferModalMixin, Operator):
     bl_idname = "skv.transfer_from"
     bl_label = "Transfer from"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
 
     def invoke(self, context, event):
         target = get_active_object(context)
@@ -1763,7 +1697,6 @@ class SKV_OT_TransferFrom(Operator):
 
     def execute(self, context):
         from .transfer import Transfer
-        from . import presets
 
         target = get_active_object(context)
         if not target:
@@ -1789,17 +1722,33 @@ class SKV_OT_TransferFrom(Operator):
             self.report({"ERROR"}, "Source has no transferable Shape Keys")
             return {"CANCELLED"}
 
-        _remove_existing_target_shape_keys(target, selected_names)
+        self._job_inherit_presets = bool(
+            context.scene.skv_props.transfer_inheritance
+        )
+        self._job_inherit_keyframes = bool(
+            context.scene.skv_props.transfer_keyframes_inheritance
+        )
 
-        transfer_data = Transfer(source=source, target=target, vertex_group=None)
-        try:
-            ok = transfer_data.transfer_shape_keys(shapekey_names=selected_names)
-        finally:
-            transfer_data.free()
+        transfer_data = Transfer(
+            source=source,
+            target=target,
+            vertex_group=None,
+        )
+        return self._transfer_begin(
+            context,
+            transfer_data,
+            selected_names,
+        )
 
-        if not ok:
-            self.report({"WARNING"}, "Nothing transferred")
-            return {"CANCELLED"}
+    def _finish_transfer(self, context):
+        from . import presets
+
+        source = self._job_source
+        target = self._job_target
+        selected_names = self._job_names
+
+        key_data = get_shape_key_data(source)
+        source_key_data = key_data
 
         target_key_data = get_shape_key_data(target)
         if target_key_data and getattr(target_key_data, "key_blocks", None):
@@ -1815,10 +1764,10 @@ class SKV_OT_TransferFrom(Operator):
 
         inherit_transferred_groups(source, target, selected_names)
 
-        if getattr(context.scene.skv_props, "transfer_inheritance", False):
+        if self._job_inherit_presets:
             presets.inherit_transferred_keys_to_presets(source, target, selected_names)
 
-        if getattr(context.scene.skv_props, "transfer_keyframes_inheritance", False):
+        if self._job_inherit_keyframes:
             inherit_transferred_keyframes(source, target, selected_names)
 
         clear_selection_ui(context, source_key_data)
@@ -1951,29 +1900,16 @@ class SKV_UL_keyframed_keys(UIList):
     bl_idname = "SKV_UL_keyframed_keys"
 
     def filter_items(self, context, data, propname):
-        names = set(
-            skv_list_key_names(
-                data,
-                context.scene.skv_props,
-                "KEYFRAMED",
-            )
+        return skv_shape_key_filter_flags(
+            self,
+            context,
+            data,
+            propname,
         )
 
-        return [
-            self.bitflag_filter_item if kb.name in names else 0
-            for kb in getattr(data, propname)
-        ], []
-
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon,
+        active_data, active_propname, index, flt_flag=0,
     ):
         SKV_UL_key_blocks.draw_item(
             self,
@@ -1985,6 +1921,7 @@ class SKV_UL_keyframed_keys(UIList):
             active_data,
             active_propname,
             index,
+            flt_flag,
         )
 
 
@@ -2035,7 +1972,6 @@ CLASSES = (
     SKV_OT_KeyToggleSelect,
     SKV_OT_SelectVisible,
     SKV_OT_FavoritesSelectVisible,
-    # SKV_OT_SelectByAffix,
     SKV_OT_MoveSelectedToGroup,
     SKV_OT_ResetGroupValues,
     SKV_OT_DeleteSelectedShapeKeys,

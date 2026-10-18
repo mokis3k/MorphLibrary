@@ -1,10 +1,7 @@
 import re
-import bpy
 
 INIT_GROUP_NAME = "Main"
 
-# Prevent recursion when preset slider writes to key values
-_PRESET_APPLY_GUARD = False
 
 # Utilities
 def get_active_object(context):
@@ -157,14 +154,6 @@ def clear_selection_ui(context, key_data):
     kd_clear_selected(key_data)
 
 
-def show_select_update(self, context):
-    obj = get_active_object(context)
-    key_data = get_shape_key_data(obj) if obj else None
-    if key_data and hasattr(key_data, "skv_selected"):
-        key_data.skv_selected.clear()
-    tag_redraw_view3d(context)
-
-
 def kd_get_group(key_data, kb_name: str) -> str:
     fallback = get_fallback_group_name(key_data)
     entries = getattr(key_data, "skv_key_groups", None)
@@ -230,14 +219,6 @@ def kd_selected_set(key_data):
 
     if source == "KEYFRAMED":
         names &= kd_keyframed_names(key_data)
-
-    elif source == "QUICK":
-        valid = {
-            kb.name
-            for kb in key_data.key_blocks[1:]
-            if skv_is_quick_shape_key_name(kb.name)
-        }
-        names &= valid
 
     return names
 
@@ -319,10 +300,13 @@ def count_selected_in_group(key_data, group_name, search):
     tokens = [token.lower() for token in parse_tokens(search)]
     selected = kd_selected_set(key_data)
 
+    mapping = kd_group_map(key_data)
+    fallback = get_fallback_group_name(key_data)
+
     return sum(
         kb.name in selected
         for kb in key_data.key_blocks[1:]
-        if kd_get_group(key_data, kb.name) == group_name
+        if mapping.get(kb.name, fallback) == group_name
         and all(token in kb.name.lower() for token in tokens)
     )
 
@@ -370,15 +354,6 @@ def ensure_init_setup_write(obj):
             pass
 
 
-def get_active_preset(key_data):
-    if not key_data or not hasattr(key_data, "skv_presets") or not hasattr(key_data, "skv_preset_index"):
-        return None
-    idx = int(key_data.skv_preset_index)
-    if 0 <= idx < len(key_data.skv_presets):
-        return key_data.skv_presets[idx]
-    return None
-
-
 def _is_basis_name(key_data, name: str) -> bool:
     try:
         if not key_data or not key_data.key_blocks:
@@ -388,58 +363,11 @@ def _is_basis_name(key_data, name: str) -> bool:
         return name == "Basis"
 
 
-def preset_apply(preset, context) -> None:
-    global _PRESET_APPLY_GUARD
-    if _PRESET_APPLY_GUARD:
-        return
-
-    key_data = getattr(preset, "id_data", None)
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-    if key_data.library is not None:
-        return
-
-    obj = get_active_object(context)
-    if not obj or get_shape_key_data(obj) is not key_data:
-        return
-
-    _PRESET_APPLY_GUARD = True
-    try:
-        keys = {
-            kb.name: kb for kb in key_data.key_blocks
-        }
-        factor = float(preset.value)
-
-        for item in preset.items:
-            kb = keys.get(item.name)
-            if kb is None:
-                continue
-
-            try:
-                value = factor * float(item.max_value)
-                if float(kb.value) != value:
-                    kb.value = value
-            except (RuntimeError, ValueError, TypeError):
-                continue
-    finally:
-        _PRESET_APPLY_GUARD = False
-
-    tag_redraw_view3d(context)
-
-
-def preset_value_update(self, context):
-    preset_apply(self, context)
-
-
 _SKV_SHAPE_KEY_LIST_SYNC_GUARD = False
 
 
 def skv_shape_key_list_sync_active() -> bool:
     return _SKV_SHAPE_KEY_LIST_SYNC_GUARD
-
-
-def skv_is_quick_shape_key_name(name: str) -> bool:
-    return bool(re.fullmatch(r"Quick Key(?: \d+)?", name or ""))
 
 
 def skv_find_shape_key_index(key_data, key_name: str) -> int:
@@ -491,7 +419,8 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
 
     This synchronizes:
     - Shape Keys in group
-    - Quick Shape Keys
+    - Favorites
+    - Keyframed Shape Keys
     - Shape Keys in active preset
     """
     global _SKV_SHAPE_KEY_LIST_SYNC_GUARD
@@ -556,7 +485,6 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
                 if key_name in kd_keyframed_names(key_data)
                 else -1
             )
-            props.quick_keys_index = key_index if skv_is_quick_shape_key_name(key_name) else -1
         except Exception:
             pass
 
@@ -619,10 +547,13 @@ def skv_list_key_names(
 
     if source == "GROUP":
         group = get_selected_group_name(key_data)
+        mapping = kd_group_map(key_data)
+        fallback = get_fallback_group_name(key_data)
+
         members = {
             kb.name
             for kb in key_data.key_blocks[1:]
-            if kd_get_group(key_data, kb.name) == group
+            if mapping.get(kb.name, fallback) == group
         }
         search = props.search
 
@@ -633,14 +564,6 @@ def skv_list_key_names(
     elif source == "KEYFRAMED":
         members = kd_keyframed_names(key_data)
         search = props.keyframed_search
-
-    elif source == "QUICK":
-        members = {
-            kb.name
-            for kb in key_data.key_blocks[1:]
-            if skv_is_quick_shape_key_name(kb.name)
-        }
-        search = props.quick_search
 
     else:
         return []
@@ -741,3 +664,61 @@ def kd_keyframed_names(key_data):
                 result.add(name)
 
     return result
+
+SKV_ROW_SELECTED = 1 << 0
+SKV_ROW_FAVORITE = 1 << 1
+SKV_ROW_AUTO_KEYFRAME = 1 << 2
+
+
+def skv_shape_key_filter_flags(ui_list, context, data, propname):
+    if data is None:
+        return [], []
+
+    source = {
+        "SKV_UL_favorites": "FAVORITES",
+        "SKV_UL_keyframed_keys": "KEYFRAMED",
+    }.get(ui_list.bl_idname, "GROUP")
+
+    visible = set(
+        skv_list_key_names(
+            data,
+            context.scene.skv_props,
+            source,
+        )
+    )
+    selected = (
+        {
+            item.name
+            for item in getattr(data, "skv_selected", ())
+        }
+        if data.skv_selection_source == source
+        else set()
+    )
+    favorites = {
+        item.name
+        for item in getattr(data, "skv_favorites", ())
+    }
+    enabled = {
+        item.name
+        for item in getattr(data, "skv_auto_keyframes", ())
+        if item.enabled
+    }
+
+    flags = []
+    for kb in getattr(data, propname):
+        name = kb.name
+        flag = (
+            ui_list.bitflag_filter_item
+            if name in visible else 0
+        )
+
+        if name in selected:
+            flag |= SKV_ROW_SELECTED
+        if name in favorites:
+            flag |= SKV_ROW_FAVORITE
+        if name in enabled:
+            flag |= SKV_ROW_AUTO_KEYFRAME
+
+        flags.append(flag)
+
+    return flags, []

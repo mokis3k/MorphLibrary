@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "Shape Keys Viewer",
-    "author": "xtafr001",
-    "version": (0, 5, 5),
+    "name": "MorphDeck",
+    "author": "mokis3k",
+    "version": (1, 0, 0),
     "blender": (5, 0, 0),
-    "location": "View3D > Sidebar > ShapeKeys",
+    "location": "View3D > Sidebar > MorphDeck",
     "description": "Shape keys grouping, selection tools, presets, and shape key transfer.",
     "category": "Object",
 }
@@ -12,7 +12,7 @@ import os
 import bpy.utils.previews
 import bpy
 from bpy.app.handlers import persistent
-from bpy.types import Operator, Panel, PropertyGroup, UIList
+from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import (
     BoolProperty,
     IntProperty,
@@ -23,7 +23,6 @@ from bpy.props import (
 )
 
 from .common import (
-    enum_groups_for_active_object,
     get_shape_key_data,
     has_group_storage,
     is_initialized,
@@ -33,13 +32,9 @@ from .common import (
     tag_redraw_view3d,
     INIT_GROUP_NAME,
     kd_selected_set,
-    kd_get_group,
     kd_set_group,
-    kd_set_selected,
-    kd_clear_selected,
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
-    skv_is_quick_shape_key_name as _is_quick_shape_key_name,
     kd_favorite_names,
     kd_prune_favorites,
     skv_list_key_names,
@@ -68,7 +63,7 @@ def _register_custom_icons():
     path = os.path.join(
         os.path.dirname(__file__),
         "icons",
-        "icon.jpg",
+        "icon.png",
     )
     if not os.path.isfile(path):
         return
@@ -81,7 +76,7 @@ def _register_custom_icons():
     except (OSError, RuntimeError, ValueError) as error:
         bpy.utils.previews.remove(collection)
         print(
-            f"ShapeKeysAdvanced: cannot load object icon: {error}"
+            f"MorphDeck: cannot load object icon: {error}"
         )
         return
 
@@ -108,30 +103,41 @@ def _poll_sync_values_source(scene, obj):
     return (not target_name) or (obj.name != target_name)
 
 
-def _iter_quick_shape_keys(key_data):
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return []
-    return [kb for kb in key_data.key_blocks if _is_quick_shape_key_name(kb.name)]
-
-
-def _next_quick_shape_key_name(key_data) -> str:
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return "Quick Key"
-
-    existing = {kb.name for kb in key_data.key_blocks}
-    if "Quick Key" not in existing:
-        return "Quick Key"
-
-    index = 1
-    while f"Quick Key {index}" in existing:
-        index += 1
-    return f"Quick Key {index}"
-
 # -----------------------------
 # Automatic object sync + auto-scan
 # -----------------------------
 
 _SKV_SYNC_GUARD = False
+_SKV_STRUCTURE_TOKEN = None
+_SKV_PRESET_SYNC_TOKEN = None
+
+
+def _skv_pointer(value):
+    return value.as_pointer() if value is not None else 0
+
+
+def _skv_updated_ids(depsgraph):
+    pointers = set()
+
+    for update in depsgraph.updates:
+        datablock = update.id
+        if datablock is not None:
+            original = getattr(
+                datablock,
+                "original",
+                datablock,
+            )
+            pointers.add(_skv_pointer(original))
+
+    return pointers
+
+
+@persistent
+def _skv_reset_runtime_caches(*_args):
+    global _SKV_STRUCTURE_TOKEN, _SKV_PRESET_SYNC_TOKEN
+
+    _SKV_STRUCTURE_TOKEN = None
+    _SKV_PRESET_SYNC_TOKEN = None
 
 
 def _shape_key_signature(obj) -> str:
@@ -229,16 +235,16 @@ def _sync_shape_key_rename_mappings(scene, obj, key_data, previous_signature: st
         except Exception:
             pass
 
-def _sync_quick_editing_state(context):
+def _sync_shape_key_sculpt_state(context):
     scene = getattr(context, "scene", None)
     props = getattr(scene, "skv_props", None) if scene else None
 
-    if not props or not props.quick_shape_key_editing:
+    if not props or not props.shape_key_sculpting:
         return
 
     obj = props.object_pick
     data = get_shape_key_data(obj)
-    key_name = props.quick_shape_key_name
+    key_name = props.sculpt_shape_key_name
 
     kb = (
         data.key_blocks.get(key_name)
@@ -255,13 +261,12 @@ def _sync_quick_editing_state(context):
     )
 
     if not editing:
-        props.quick_shape_key_editing = False
-        props.quick_shape_key_name = ""
+        props.shape_key_sculpting = False
+        props.sculpt_shape_key_name = ""
         tag_redraw_view3d(context)
 
-def _auto_process_active_object(scene):
-
-    global _SKV_SYNC_GUARD
+def _auto_process_active_object(scene, updated_ids=None):
+    global _SKV_SYNC_GUARD, _SKV_STRUCTURE_TOKEN
     if _SKV_SYNC_GUARD:
         return
 
@@ -274,7 +279,27 @@ def _auto_process_active_object(scene):
 
     desired = active if (active and getattr(active, "type", None) == "MESH") else None
     desired_name = desired.name if desired else ""
+    data = get_shape_key_data(desired)
+    mesh = getattr(desired, "data", None)
+
+    token = (
+        _skv_pointer(scene),
+        _skv_pointer(desired),
+        _skv_pointer(mesh),
+        _skv_pointer(data),
+        len(data.key_blocks) if data is not None else 0,
+        desired_name,
+    )
+
+    if (
+            updated_ids is not None
+            and token == _SKV_STRUCTURE_TOKEN
+            and not updated_ids.intersection(token[1:4])
+    ):
+        return
+
     desired_signature = _shape_key_signature(desired)
+    _SKV_STRUCTURE_TOKEN = token
 
     if (
         getattr(props, "last_active_object_name", "") == desired_name
@@ -324,9 +349,10 @@ def _auto_process_active_object(scene):
             return
 
         if not is_initialized(key_data):
-            from .common import ensure_init_setup_write
+            tag_redraw_view3d(ctx)
+            return
 
-            ensure_init_setup_write(desired)
+        kd_prune_favorites(key_data)
 
         if object_changed:
             basis_name = ""
@@ -357,21 +383,20 @@ _SKV_DEPSGRAPH_GUARD = False
 
 @persistent
 def _depsgraph_update_post(scene, depsgraph):
-    global _SKV_DEPSGRAPH_GUARD
+    global _SKV_DEPSGRAPH_GUARD, _SKV_PRESET_SYNC_TOKEN
+
+    if transfer.is_transfer_running():
+        return
 
     if _SKV_DEPSGRAPH_GUARD:
         return
 
     _SKV_DEPSGRAPH_GUARD = True
     try:
-        _sync_quick_editing_state(bpy.context)
-        _auto_process_active_object(scene)
+        updated_ids = _skv_updated_ids(depsgraph)
 
-        kd_prune_favorites(
-            get_shape_key_data(
-                getattr(bpy.context, "active_object", None)
-            )
-        )
+        _sync_shape_key_sculpt_state(bpy.context)
+        _auto_process_active_object(scene, updated_ids)
 
         props = getattr(scene, "skv_props", None)
         obj = (
@@ -386,7 +411,22 @@ def _depsgraph_update_post(scene, depsgraph):
                 item for item in entries if item.enabled
             ]
 
-            if data and data.library is None and enabled:
+            if (
+                    data
+                    and data.library is None
+                    and enabled
+                    and (
+                    updated_ids.intersection({
+                        _skv_pointer(obj),
+                        _skv_pointer(obj.data),
+                        _skv_pointer(data),
+                    })
+                    or any(
+                int(scene.frame_current) != item.last_frame
+                for item in enabled
+                    )
+                )
+            ):
                 keys = {
                     kb.name: kb for kb in data.key_blocks
                 }
@@ -418,84 +458,163 @@ def _depsgraph_update_post(scene, depsgraph):
                         item.last_value = value
 
         preset = presets.get_active_global_preset(scene)
+
         if preset is not None:
+            token = (
+                _skv_pointer(scene),
+                _skv_pointer(preset),
+                len(preset.items),
+                float(scene.frame_current_final),
+            )
+            full_sync = (
+                token != _SKV_PRESET_SYNC_TOKEN
+                or _skv_pointer(scene) in updated_ids
+            )
+
             presets.sync_preset_item_values(
                 bpy.context,
                 preset,
+                updated_ids=(
+                    None if full_sync else updated_ids
+                ),
             )
+            _SKV_PRESET_SYNC_TOKEN = token
+        else:
+            _SKV_PRESET_SYNC_TOKEN = None
     finally:
         _SKV_DEPSGRAPH_GUARD = False
 
 
 def _ensure_handler_installed():
-    h = bpy.app.handlers.depsgraph_update_post
-    if _depsgraph_update_post not in h:
-        h.append(_depsgraph_update_post)
+    _skv_reset_runtime_caches()
+
+    handlers = bpy.app.handlers
+    bindings = (
+        (
+            handlers.depsgraph_update_post,
+            _depsgraph_update_post,
+        ),
+        (
+            handlers.load_post,
+            _skv_reset_runtime_caches,
+        ),
+        (
+            handlers.undo_post,
+            _skv_reset_runtime_caches,
+        ),
+        (
+            handlers.redo_post,
+            _skv_reset_runtime_caches,
+        ),
+    )
+
+    for collection, callback in bindings:
+        if callback not in collection:
+            collection.append(callback)
 
 
 def _ensure_handler_removed():
-    h = bpy.app.handlers.depsgraph_update_post
-    if _depsgraph_update_post in h:
-        h.remove(_depsgraph_update_post)
+    handlers = bpy.app.handlers
+    bindings = (
+        (
+            handlers.depsgraph_update_post,
+            _depsgraph_update_post,
+        ),
+        (
+            handlers.load_post,
+            _skv_reset_runtime_caches,
+        ),
+        (
+            handlers.undo_post,
+            _skv_reset_runtime_caches,
+        ),
+        (
+            handlers.redo_post,
+            _skv_reset_runtime_caches,
+        ),
+    )
+
+    for collection, callback in bindings:
+        if callback in collection:
+            collection.remove(callback)
+
+    _skv_reset_runtime_caches()
 
 
 # -----------------------------
 # UI Lists
 # -----------------------------
-class SKV_UL_quick_shape_keys(UIList):
-    bl_idname = "SKV_UL_quick_shape_keys"
-
-    def filter_items(self, context, data, propname):
-        names = set(
-            skv_list_key_names(
-                data,
-                context.scene.skv_props,
-                "QUICK",
-            )
-        )
-
-        return [
-            self.bitflag_filter_item if kb.name in names else 0
-            for kb in getattr(data, propname)
-        ], []
-
-    def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
-    ):
-        row = layout.row(align=True)
-
-        groups.SKV_UL_key_blocks.draw_item(
-            self,
-            context,
-            row,
-            data,
-            item,
-            icon,
-            active_data,
-            active_propname,
-            index,
-        )
-
-        op = row.operator(
-            "skv.quick_shape_key_delete",
-            text="",
-            icon="TRASH",
-            emboss=False,
-        )
-        op.key_index = index
 
 
 # -----------------------------
 # Operators
 # -----------------------------
+
+class SKV_OT_InitializeObject(Operator):
+    bl_idname = "skv.initialize_object"
+    bl_label = "Initialize Morph Library"
+    bl_description = "Create addon groups for this object's shape keys"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "active_object", None)
+        if obj is None or obj.type != "MESH":
+            return False
+
+        data = get_shape_key_data(obj)
+
+        return bool(
+            data
+            and data.key_blocks
+            and has_group_storage(data)
+            and not is_initialized(data)
+            and obj.library is None
+            and obj.data.library is None
+            and data.library is None
+        )
+
+    def execute(self, context):
+        from .common import ensure_init_setup_write
+
+        if not self.poll(context):
+            return {"CANCELLED"}
+
+        obj = context.active_object
+
+        try:
+            ensure_init_setup_write(obj)
+
+            if not is_initialized(get_shape_key_data(obj)):
+                raise RuntimeError(
+                    "Addon storage was not initialized."
+                )
+
+            context.scene.skv_props.object_pick = obj
+
+            skv_sync_shape_key_list_indices(
+                context,
+                obj,
+                set_blender_active=False,
+            )
+
+        except Exception as error:
+            print(
+                "MorphDeck: initialization failed: "
+                f"{error}"
+            )
+            self.report(
+                {"WARNING"},
+                "Initialization could not finish. "
+                "Use Undo to restore the previous state.",
+            )
+
+            # Keep an undo step if initialization changed some data.
+            tag_redraw_view3d(context)
+            return {"FINISHED"}
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
 
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -603,8 +722,8 @@ class SKV_OT_SynchronizeValues(Operator):
         return {"FINISHED"}
 
 
-class SKV_OT_QuickShapeKeyAdd(Operator):
-    bl_idname = "skv.quick_shape_key_add"
+class SKV_OT_ShapeKeyAdd(Operator):
+    bl_idname = "skv.shape_key_add"
     bl_label = "Add Shape Key"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -657,8 +776,8 @@ class SKV_OT_QuickShapeKeyAdd(Operator):
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
 
-        props.quick_shape_key_editing = False
-        props.quick_shape_key_name = ""
+        props.shape_key_sculpting = False
+        props.sculpt_shape_key_name = ""
 
         try:
             if get_shape_key_data(obj) is None:
@@ -706,116 +825,16 @@ class SKV_OT_QuickShapeKeyAdd(Operator):
             tag_redraw_view3d(context)
             return {"FINISHED"}
 
-        props.quick_shape_key_editing = True
-        props.quick_shape_key_name = new_kb.name
+        props.shape_key_sculpting = True
+        props.sculpt_shape_key_name = new_kb.name
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
 
-class SKV_OT_QuickShapeKeyDelete(Operator):
-    bl_idname = "skv.quick_shape_key_delete"
-    bl_label = "Delete Shape Key"
-    bl_options = {"REGISTER", "UNDO"}
-
-    key_index: IntProperty(name="Key Index", default=-1)
-
-    @classmethod
-    def poll(cls, context):
-        obj = getattr(context.scene.skv_props, "object_pick", None) if hasattr(context.scene, "skv_props") else None
-        key_data = get_shape_key_data(obj) if obj else None
-        return bool(obj and getattr(obj, "type", None) == "MESH" and key_data and getattr(key_data, "key_blocks", None))
-
-    def invoke(self, context, event):
-        props = context.scene.skv_props
-        obj = props.object_pick
-        data = get_shape_key_data(obj)
-
-        if not data or not data.key_blocks or data.library is not None:
-            return {"CANCELLED"}
-
-        index = int(self.key_index)
-        if not 0 <= index < len(data.key_blocks):
-            return {"CANCELLED"}
-
-        if not _is_quick_shape_key_name(data.key_blocks[index].name):
-            return {"CANCELLED"}
-
-        return context.window_manager.invoke_props_dialog(
-            self,
-            width=360,
-        )
-
-    def draw(self, context):
-        self.layout.label(
-            text="Delete this Quick Shape Key?",
-            icon="QUESTION",
-        )
-
-        data = get_shape_key_data(context.scene.skv_props.object_pick)
-        index = int(self.key_index)
-
-        if data and 0 <= index < len(data.key_blocks):
-            self.layout.label(text=data.key_blocks[index].name)
-
-    def execute(self, context):
-        props = context.scene.skv_props
-        obj = getattr(props, "object_pick", None)
-        key_data = get_shape_key_data(obj) if obj else None
-
-        if not obj or getattr(obj, "type", None) != "MESH" or not key_data or not getattr(key_data, "key_blocks", None):
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        idx = int(self.key_index)
-        if not (0 <= idx < len(key_data.key_blocks)):
-            return {"CANCELLED"}
-
-        kb = key_data.key_blocks[idx]
-        key_name = kb.name
-        if not _is_quick_shape_key_name(key_name):
-            return {"CANCELLED"}
-
-        try:
-            context.view_layer.objects.active = obj
-        except Exception:
-            pass
-
-        if context.mode != "OBJECT":
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception:
-                pass
-
-        try:
-            obj.shape_key_remove(kb)
-        except Exception:
-            self.report({"ERROR"}, "Failed to delete shape key.")
-            return {"CANCELLED"}
-
-        key_data = get_shape_key_data(obj)
-        try:
-            if key_data and getattr(key_data, "key_blocks", None):
-                props.quick_keys_index = min(max(0, idx - 1), len(key_data.key_blocks) - 1)
-            else:
-                props.quick_keys_index = -1
-        except Exception:
-            pass
-
-        if getattr(props, "quick_shape_key_name", "") == key_name:
-            props.quick_shape_key_editing = False
-            props.quick_shape_key_name = ""
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-class SKV_OT_QuickShapeKeyFix(Operator):
-    bl_idname = "skv.quick_shape_key_fix"
-    bl_label = "Fix"
+class SKV_OT_FinishShapeKeySculpt(Operator):
+    bl_idname = "skv.finish_shape_key_sculpt"
+    bl_label = "Finish Sculpting"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -826,12 +845,12 @@ class SKV_OT_QuickShapeKeyFix(Operator):
 
         return bool(
             props
-            and props.quick_shape_key_editing
+            and props.shape_key_sculpting
             and obj is not None
             and context.active_object == obj
             and obj.mode == "SCULPT"
             and getattr(obj.active_shape_key, "name", "")
-            == props.quick_shape_key_name
+            == props.sculpt_shape_key_name
         )
 
     def execute(self, context):
@@ -850,8 +869,8 @@ class SKV_OT_QuickShapeKeyFix(Operator):
         except Exception:
             pass
 
-        props.quick_shape_key_editing = False
-        props.quick_shape_key_name = ""
+        props.shape_key_sculpting = False
+        props.sculpt_shape_key_name = ""
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -860,61 +879,6 @@ class SKV_OT_QuickShapeKeyFix(Operator):
 # -----------------------------
 # Scene Props (UI state)
 # -----------------------------
-def transfer_open_update(self, context):
-    # Clear last transfer status when the module is collapsed.
-    if not getattr(self, "transfer_open", False):
-        obj = getattr(context, "active_object", None)
-        def transfer_open_update(self, context):
-            # No legacy transfer status to clear.
-            pass
-
-
-# def affix_select_update(self, context):
-#     obj = getattr(self, "object_pick", None)
-#     if not obj:
-#         return
-#
-#     key_data = get_shape_key_data(obj)
-#     if not key_data or not getattr(key_data, "key_blocks", None):
-#         return
-#     if not has_group_storage(key_data) or not is_initialized(key_data):
-#         return
-#
-#     kd_clear_selected(key_data)
-#
-#     text = (getattr(self, "affix_value", "") or "").strip()
-#     if not text:
-#         tag_redraw_view3d(context)
-#         return
-#
-#     text_l = text.lower()
-#     mode = getattr(self, "affix_type", "PREFIX")
-#     group_name = get_selected_group_name(key_data)
-#     matched = []
-#
-#     for kb in key_data.key_blocks:
-#         if kb.name == "Basis":
-#             continue
-#         if kd_get_group(key_data, kb.name) != group_name:
-#             continue
-#
-#         kb_name_l = kb.name.lower()
-#
-#         if mode == "PREFIX" and kb_name_l.startswith(text_l):
-#             matched.append(kb.name)
-#         elif mode == "SUFFIX" and kb_name_l.endswith(text_l):
-#             matched.append(kb.name)
-#
-#     for name in matched:
-#         kd_set_selected(key_data, name, True)
-#
-#     if matched:
-#         self.last_affix_name = text
-#         self.last_affix_pending = True
-#
-#     tag_redraw_view3d(context)
-
-
 def keys_index_update(self, context):
     # Sync Shape Keys in group list selection to all shape key lists.
     if skv_shape_key_list_sync_active():
@@ -934,25 +898,6 @@ def keys_index_update(self, context):
             set_blender_active=True,
         )
 
-
-def quick_keys_index_update(self, context):
-    # Sync Quick Shape Keys list selection to all shape key lists.
-    if skv_shape_key_list_sync_active():
-        return
-
-    obj = getattr(self, "object_pick", None)
-    key_data = get_shape_key_data(obj) if obj else None
-    if not key_data or not getattr(key_data, "key_blocks", None):
-        return
-
-    idx = int(getattr(self, "quick_keys_index", -1))
-    if 0 <= idx < len(key_data.key_blocks):
-        skv_sync_shape_key_list_indices(
-            context,
-            obj,
-            key_data.key_blocks[idx].name,
-            set_blender_active=True,
-        )
 
 def favorites_index_update(self, context):
     if skv_shape_key_list_sync_active():
@@ -1006,10 +951,6 @@ class SKV_Props(PropertyGroup):
     )
     search: StringProperty(name="Search", default="")
 
-    quick_search: StringProperty(
-        name="Quick Shape Keys Search",
-        default="",
-    )
 
     favorites_search: StringProperty(
         name="Favorites Search",
@@ -1034,16 +975,8 @@ class SKV_Props(PropertyGroup):
         update=keyframed_index_update,
     )
 
-    groups_module_open: BoolProperty(name="Shape Keys", default=True)
     groups_open: BoolProperty(name="Groups", default=True)
     keys_open: BoolProperty(name="Keys", default=True)
-    quick_keys_open: BoolProperty(name="Quick Shape Keys", default=False)
-    quick_keys_index: IntProperty(
-        name="Quick Shape Keys Index",
-        default=-1,
-        min=-1,
-        update=quick_keys_index_update,
-    )
 
     object_pick: PointerProperty(
         name="Object",
@@ -1066,10 +999,9 @@ class SKV_Props(PropertyGroup):
 
     presets_open: BoolProperty(name="Presets", default=True)
 
-    quick_shape_key_editing: BoolProperty(name="Quick Shape Key Editing", default=False)
-    quick_shape_key_name: StringProperty(name="Quick Shape Key Name", default="")
+    shape_key_sculpting: BoolProperty(name="Shape Key Sculpting", default=False)
+    sculpt_shape_key_name: StringProperty(name="Sculpt Shape Key Name", default="")
 
-    transfer_open: BoolProperty(name="Shape Keys Transfer", default=False)
     transfer_inheritance: BoolProperty(
         name="Inherit presets",
         default=False,
@@ -1080,62 +1012,41 @@ class SKV_Props(PropertyGroup):
         default=False,
         description="Copy keyframes from transferred source shape keys to matching target shape keys",
     )
-    move_to_group: EnumProperty(name="Move To", items=enum_groups_for_active_object)
 
-#     affix_type: EnumProperty(
-#         name="Type",
-#         items=[
-#             ("PREFIX", "Prefix", "Select by prefix"),
-#             ("SUFFIX", "Suffix", "Select by suffix"),
-#         ],
-#         default="PREFIX",
-#         update=affix_select_update,
-#     )
-#     affix_value: StringProperty(
-#         name="Value",
-#         default="",
-#         description="Comma/semicolon separated list (e.g. L_, R_ or _L, _R)",
-#         update=affix_select_update,
-#     )
-
-    last_affix_name: StringProperty(name="Last Affix Name", default="")
-    last_affix_pending: BoolProperty(name="Last Affix Pending", default=False)
-
-
-def _draw_quick_shape_keys_block(layout, context, obj, key_data=None):
+def _draw_shape_key_sculpt_actions(layout, context, obj, key_data=None):
     props = context.scene.skv_props
 
     layout.separator()
 
     editing = (
-        props.quick_shape_key_editing
+        props.shape_key_sculpting
         and obj is not None
         and context.active_object == obj
         and obj.mode == "SCULPT"
         and getattr(obj.active_shape_key, "name", "")
-        == props.quick_shape_key_name
+        == props.sculpt_shape_key_name
     )
 
     if editing:
         layout.operator(
-            "skv.quick_shape_key_fix",
-            text="Fix",
+            "skv.finish_shape_key_sculpt",
+            text="Finish Sculpting",
             icon="CHECKMARK",
         )
     else:
         layout.operator(
-            "skv.quick_shape_key_add",
+            "skv.shape_key_add",
             text="Add Shape Key",
             icon="ADD",
         )
 
 
 class SKV_PT_ShapeKeysPanel(Panel):
-    bl_label = "Shape Keys Manager"
-    bl_idname = "SKV_PT_shape_keys_viewer_panel"
+    bl_label = "Morph Library"
+    bl_idname = "SKV_PT_morph_library_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "ShapeKeys"
+    bl_category = "MorphDeck"
     bl_order = 0
 
     def draw_header(self, context):
@@ -1179,11 +1090,31 @@ class SKV_PT_ShapeKeysPanel(Panel):
             row = layout.row(align=True)
             row.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
 
-            _draw_quick_shape_keys_block(layout, context, obj, key_data)
+            _draw_shape_key_sculpt_actions(layout, context, obj, key_data)
             return
         if not has_group_storage(key_data):
             return
+
         if not is_initialized(key_data):
+            if (
+                    obj.library is not None
+                    or obj.data.library is not None
+                    or key_data.library is not None
+            ):
+                layout.label(
+                    text="Linked data is read-only",
+                    icon="INFO",
+                )
+            else:
+                layout.label(
+                    text="Setup is required for this object",
+                    icon="INFO",
+                )
+                layout.operator(
+                    "skv.initialize_object",
+                    icon="ADD",
+                )
+
             return
 
         top_actions = layout.row(align=True)
@@ -1267,17 +1198,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 rows=key_rows,
             )
 
-            # Prefix/suffix selection UI is temporarily disabled.
-            # if group_count > 0:
-            #     row = keys_col.row(align=True)
-            #     row.prop(props, "affix_type", text="")
-            #     row.prop(props, "affix_value", text="", icon="FILTER")
 
             selected_count = count_selected_in_group(key_data, current_group, getattr(props, "search", ""))
 
             if selected_count > 0 and group_count > 0:
-                # keys_col.separator()
-                # keys_col.label(text=f"Selected: {selected_count}")
 
                 r1 = keys_col.row(align=True)
                 r1m = r1.row(align=True)
@@ -1298,7 +1222,7 @@ class SKV_PT_ShapeKeysPanel(Panel):
                 r4 = keys_col.row(align=True)
                 r4.operator("skv.transfer_to", text="Transfer to...", icon="EXPORT")
 
-        _draw_quick_shape_keys_block(layout, context, obj, key_data)
+        _draw_shape_key_sculpt_actions(layout, context, obj, key_data)
 
 
 class SKV_PT_FavoritesPanel(Panel):
@@ -1306,7 +1230,7 @@ class SKV_PT_FavoritesPanel(Panel):
     bl_idname = "SKV_PT_favorites_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "ShapeKeys"
+    bl_category = "MorphDeck"
     bl_order = 20
 
     def draw_header(self, context):
@@ -1439,14 +1363,14 @@ class SKV_PT_KeyframedPanel(Panel):
     bl_idname = "SKV_PT_keyframed_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "ShapeKeys"
+    bl_category = "MorphDeck"
     bl_order = 25
 
     def draw_header(self, context):
         self.layout.label(text="", icon="KEYINGSET")
 
     def draw(self, context):
-        layout = self.layout
+        layout = self.layout.column(align=True)
         props = context.scene.skv_props
         obj = props.object_pick
         data = get_shape_key_data(obj)
@@ -1558,7 +1482,7 @@ class SKV_PT_PresetsPanel(Panel):
     bl_idname = "SKV_PT_shape_keys_presets_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "ShapeKeys"
+    bl_category = "MorphDeck"
     bl_order = 30
 
     def draw_header(self, context):
@@ -1674,39 +1598,13 @@ class SKV_PT_PresetsPanel(Panel):
                             rows=max(1, min(len(object_items), 5)),
                         )
 
-class SKV_OT_QuickSelectVisible(Operator):
-    bl_idname = "skv.quick_select_visible"
-    bl_label = "Select Quick Shape Keys"
-    bl_options = {"REGISTER", "UNDO"}
-
-    mode: StringProperty(name="Mode", default="ALL")
-
-    def execute(self, context):
-        return groups._select_visible_from_list(
-            self,
-            context,
-            "QUICK",
-        )
-
-
-class SKV_OT_QuickSearchClear(Operator):
-    bl_idname = "skv.quick_search_clear"
-    bl_label = "Clear Quick Shape Keys Search"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        props = context.scene.skv_props
-        props.quick_search = ""
-        props.quick_keys_index = -1
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
 
 _LOCAL_CLASSES = (
+    SKV_OT_InitializeObject,
     SKV_OT_SearchClear,
     SKV_OT_SynchronizeValues,
-    SKV_OT_QuickShapeKeyAdd,
-    SKV_OT_QuickShapeKeyFix,
+    SKV_OT_ShapeKeyAdd,
+    SKV_OT_FinishShapeKeySculpt,
     SKV_Props,
     SKV_PT_ShapeKeysPanel,
     SKV_PT_FavoritesPanel,
@@ -1724,17 +1622,12 @@ _SKV_OPERATOR_DESCRIPTIONS = {
     "skv.synchronize_values":
         "Copy matching shape key values from the source mesh to this object",
 
-    "skv.quick_shape_key_add":
+    "skv.shape_key_add":
         "Create a shape key in the current group and enter Sculpt Mode",
 
-    "skv.quick_shape_key_fix":
+    "skv.finish_shape_key_sculpt":
         "Finish editing the shape key and return to Object Mode",
 
-    "skv.quick_shape_key_delete":
-        "Delete this shape key from the object",
-
-    "skv.active_key_remove":
-        "Remove this entry from Active Shape Keys without deleting the shape key",
 
     "skv.shape_key_toggle_visibility":
         "Enable or disable this shape key's contribution to the mesh",
@@ -1754,8 +1647,6 @@ _SKV_OPERATOR_DESCRIPTIONS = {
     "skv.keyframed_select_visible":
         "Change selection in Keyframed Shape Keys",
 
-    "skv.quick_select_visible":
-        "Change selection in this list",
 
     "skv.move_selected_to_group":
         "Move selected shape keys to the chosen group",
@@ -1799,8 +1690,6 @@ _SKV_OPERATOR_DESCRIPTIONS = {
     "skv.keyframed_search_clear":
         "Clear the Keyframed Shape Keys search filter",
 
-    "skv.quick_search_clear":
-        "Clear the search filter in this list",
 
     "skv.preset_capture_max_index":
         "Save current shape key values as reference values for this preset",
@@ -1847,7 +1736,6 @@ _SKV_SELECTION_SCOPES = {
     "skv.select_visible": "the current group",
     "skv.favorites_select_visible": "Favorites",
     "skv.keyframed_select_visible": "Keyframed Shape Keys",
-    "skv.quick_select_visible": "this list",
 }
 
 
@@ -1973,31 +1861,16 @@ def register():
                 "Keyframed",
                 "Selection belongs to the keyframed list",
             ),
-            (
-                "QUICK",
-                "Quick",
-                "Selection belongs to the quick shape keys list",
-            ),
         ],
         default="GROUP",
     )
     bpy.types.Key.skv_favorites = CollectionProperty(
         type=groups.SKV_SelectedName,
     )
-    items = [
-        ("GROUP", "Group", "Selection belongs to the group list"),
-        ("FAVORITES", "Favorites", "Selection belongs to Favorites"),
-        (
-            "KEYFRAMED",
-            "Keyframed",
-            "Selection belongs to the keyframed list",
-        ),
-    ],
     bpy.types.Key.skv_key_groups = CollectionProperty(type=groups.SKV_KeyGroupEntry)
 
     bpy.types.Key.skv_auto_keyframes = CollectionProperty(type=groups.SKV_AutoKeyframeEntry)
 
-    bpy.types.Object.skv_transfer_settings = PointerProperty(type=transfer.SKV_TransferSettings)
 
     _ensure_handler_installed()
     try:
@@ -2011,15 +1884,12 @@ def register():
 def unregister():
     _ensure_handler_removed()
 
-    if hasattr(bpy.types.Object, "skv_transfer_settings"):
-        del bpy.types.Object.skv_transfer_settings
 
     if hasattr(bpy.types.Key, "skv_auto_keyframes"):
         del bpy.types.Key.skv_auto_keyframes
 
     del bpy.types.Key.skv_key_groups
     del bpy.types.Key.skv_favorites
-    del bpy.types.Key.skv_selection_source
     if hasattr(bpy.types.Key, "skv_selection_source"):
         del bpy.types.Key.skv_selection_source
     del bpy.types.Key.skv_selected

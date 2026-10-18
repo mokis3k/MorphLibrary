@@ -1,6 +1,19 @@
 import bpy
-from bpy.types import Operator, PropertyGroup, UIList, Menu
-from bpy.props import IntProperty, FloatProperty, StringProperty, CollectionProperty, BoolProperty
+from bpy.types import (
+    Operator,
+    PropertyGroup,
+    UIList,
+    Menu,
+)
+from bpy.props import (
+    IntProperty,
+    FloatProperty,
+    StringProperty,
+    CollectionProperty,
+    BoolProperty,
+)
+
+from .transfer import TransferModalMixin
 
 from .common import (
     get_active_object,
@@ -53,13 +66,20 @@ def get_active_global_preset(scene):
     return None
 
 
-def sync_preset_item_values(context, preset) -> None:
+def sync_preset_item_values(
+    context,
+    preset,
+    updated_ids=None,
+) -> None:
     global _PRESET_ITEM_SYNC_GUARD
 
     previous_guard = _PRESET_ITEM_SYNC_GUARD
     _PRESET_ITEM_SYNC_GUARD = True
     try:
-        for item, data, kb in _iter_resolved_preset_items(preset):
+        for item, data, kb in _iter_resolved_preset_items(
+                preset,
+                updated_ids=updated_ids,
+        ):
             value = float(kb.value)
             if float(item.value) != value:
                 try:
@@ -152,28 +172,49 @@ def global_preset_value_update(self, context):
     global_preset_apply(self, context)
 
 
-def _iter_resolved_preset_items(preset):
+def _iter_resolved_preset_items(preset, updated_ids=None):
     objects = {}
+    key_maps = {}
 
     for item in preset.items:
         name = item.object_name
 
         if name not in objects:
-            obj = bpy.data.objects.get(name) if name else None
+            obj = (
+                bpy.data.objects.get(name)
+                if name else None
+            )
             data = (
                 get_shape_key_data(obj)
                 if obj and obj.type == "MESH"
                 else None
             )
-            keys = (
-                {kb.name: kb for kb in data.key_blocks}
-                if data and data.key_blocks
-                else {}
+
+            relevant = data is not None and (
+                updated_ids is None
+                or obj.as_pointer() in updated_ids
+                or obj.data.as_pointer() in updated_ids
+                or data.as_pointer() in updated_ids
             )
+
+            if relevant:
+                pointer = data.as_pointer()
+
+                if pointer not in key_maps:
+                    key_maps[pointer] = {
+                        kb.name: kb
+                        for kb in data.key_blocks
+                    }
+
+                keys = key_maps[pointer]
+            else:
+                keys = {}
+
             objects[name] = (data, keys)
 
         data, keys = objects[name]
         kb = keys.get(item.key_name)
+
         if kb is not None:
             yield item, data, kb
 
@@ -576,11 +617,14 @@ class SKV_OT_preset_object_select(Operator):
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
-class SKV_OT_preset_object_transfer(Operator):
+class SKV_OT_preset_object_transfer(
+    TransferModalMixin,
+    Operator,
+):
     bl_idname = "skv.preset_object_transfer"
     bl_label = "Transfer Shape Keys"
     bl_description = "Transfer this object's shape keys from the selected preset"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
 
     object_name: StringProperty(name="Source Object", default="")
     preset_index: IntProperty(name="Preset Index", default=-1)
@@ -599,10 +643,6 @@ class SKV_OT_preset_object_transfer(Operator):
 
     def execute(self, context):
         from .transfer import Transfer
-        from .groups import (
-            inherit_transferred_groups,
-            inherit_transferred_keyframes,
-        )
 
         scene = context.scene
         index = int(self.preset_index)
@@ -663,32 +703,54 @@ class SKV_OT_preset_object_transfer(Operator):
         ]
         missing = [name for name in names if name not in existing]
 
-        if context.mode != "OBJECT":
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except RuntimeError as error:
-                self.report({"ERROR"}, str(error))
-                return {"CANCELLED"}
+        self._job_source = source
+        self._job_target = target
+        self._preset_names = names
+        self._preset_existing = existing
+        self._preset_max = source_max
+        self._preset_pointer = preset.as_pointer()
+        self._preset_index = index
 
-        created = []
-        if missing:
-            transfer = Transfer(
+        transfer = (
+            Transfer(
                 source=source,
                 target=target,
                 vertex_group=None,
             )
-            try:
-                for name in missing:
-                        if transfer.transfer_shape_keys(shapekey_names=[name]):
-                            created.append(name)
-                        else:
-                            # Remove an incomplete new key if writing failed.
-                            data = get_shape_key_data(target)
-                            kb = data.key_blocks.get(name) if data else None
-                            if kb is not None:
-                                target.shape_key_remove(kb)
-            finally:
-                transfer.free()
+            if missing else None
+        )
+
+        return self._transfer_begin(
+            context,
+            transfer,
+            missing,
+        )
+
+    def _finish_transfer(self, context):
+        from .groups import (
+            inherit_transferred_groups,
+            inherit_transferred_keyframes,
+        )
+
+        scene = self._job_scene
+        preset = scene.skv_global_presets[
+            self._preset_index
+        ]
+
+        if preset.as_pointer() != self._preset_pointer:
+            raise RuntimeError(
+                "The selected preset changed during transfer."
+            )
+
+        source = self._job_source
+        target = self._job_target
+        source_data = get_shape_key_data(source)
+
+        names = self._preset_names
+        existing = self._preset_existing
+        source_max = self._preset_max
+        missing = self._job_names
+        created = list(missing)
 
         target_data = get_shape_key_data(target)
         resolved = [
