@@ -758,12 +758,8 @@ class SKV_OT_ShapeKeyAdd(Operator):
         if data is not None:
             ensure_init_setup_write(obj)
 
-        # Capture the selected group before creation triggers handlers.
-        target_group = (
-            get_selected_group_name(data)
-            if data
-            else INIT_GROUP_NAME
-        )
+        # Keep keys created by this operator in a dedicated object-local group.
+        target_group = "Created"
 
         try:
             if context.mode != "OBJECT":
@@ -794,14 +790,26 @@ class SKV_OT_ShapeKeyAdd(Operator):
                 from_mix=False,
             )
 
+            data = get_shape_key_data(obj)
+
+            if not groups._ensure_group_exists(data, target_group):
+                obj.shape_key_remove(new_kb)
+                raise RuntimeError(
+                    "Cannot create the Created shape key group."
+                )
+
+            kd_set_group(data, new_kb.name, target_group)
+
+            self.report(
+                {"INFO"},
+                f'Shape key "{new_kb.name}" added to group "{target_group}".',
+            )
+
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
 
-        data = get_shape_key_data(obj)
-        kd_set_group(data, new_kb.name, target_group)
-
-        # Reveal the new key in the existing group list.
+        # Reveal the new key and activate its Created group.
         props.keys_open = True
         props.search = ""
 
@@ -1186,6 +1194,11 @@ class SKV_PT_ShapeKeysPanel(Panel):
                     "skv.select_visible",
                     text="Invert",
                 ).mode = "INVERT"
+
+                row.operator(
+                    "skv.select_visible",
+                    text="Non-Zero",
+                ).mode = "NONZERO"
 
             key_rows = max(1, min(group_count, 5))
             keys_col.template_list(
@@ -1623,7 +1636,7 @@ _SKV_OPERATOR_DESCRIPTIONS = {
         "Copy matching shape key values from the source mesh to this object",
 
     "skv.shape_key_add":
-        "Create a shape key in the current group and enter Sculpt Mode",
+        "Create a shape key in the Created group and enter Sculpt Mode",
 
     "skv.finish_shape_key_sculpt":
         "Finish editing the shape key and return to Object Mode",
@@ -1755,6 +1768,10 @@ def _skv_operator_description(cls, context, properties):
             ),
             "INVERT": (
                 f"Invert selection for shape keys matching the search in {scope}"
+            ),
+            "NONZERO": (
+                f"Select shape keys with non-zero values matching the search "
+                f"in {scope}; deselect matching keys with zero values"
             ),
         }.get(mode, cls.bl_description)
 

@@ -634,29 +634,114 @@ def inherit_transferred_keyframes(source_obj, target_obj, key_names) -> int:
 
     return copied
 
+def _group_shape_keys(key_data, group_name):
+    if not key_data or not key_data.key_blocks:
+        return []
+
+    return [
+        kb
+        for kb in list(key_data.key_blocks)[1:]
+        if kd_get_group(key_data, kb.name) == group_name
+    ]
+
+
+class SKV_OT_GroupToggleVisibility(Operator):
+    bl_idname = "skv.group_toggle_visibility"
+    bl_label = "Show / Hide Group"
+    bl_description = (
+        "Show or hide all shape keys in this group "
+        "without changing their values"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_name: StringProperty(name="Group", default="")
+
+    def execute(self, context):
+        props = getattr(context.scene, "skv_props", None)
+        obj = getattr(props, "object_pick", None)
+        key_data = get_shape_key_data(obj)
+
+        if (
+            not key_data
+            or not key_data.key_blocks
+            or key_data.library is not None
+            or not is_initialized(key_data)
+        ):
+            return {"CANCELLED"}
+
+        if not any(
+            group.name == self.group_name
+            for group in key_data.skv_groups
+        ):
+            return {"CANCELLED"}
+
+        keys = _group_shape_keys(key_data, self.group_name)
+
+        if not keys:
+            return {"CANCELLED"}
+
+        # Hide a visible or partially hidden group; show a fully hidden group.
+        hide = not all(kb.mute for kb in keys)
+
+        for kb in keys:
+            if kb.mute != hide:
+                kb.mute = hide
+
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
 # -----------------------------
 # UI Lists
 # -----------------------------
 class SKV_UL_Groups(UIList):
     bl_idname = "SKV_UL_groups"
 
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        g = item
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        group = item
         key_data = data
 
         try:
-            if not getattr(g, "last_name", ""):
-                g.last_name = g.name
+            if not getattr(group, "last_name", ""):
+                group.last_name = group.name
         except Exception:
             pass
 
+        keys = _group_shape_keys(key_data, group.name)
+        hidden = bool(keys) and all(kb.mute for kb in keys)
+
         row = layout.row(align=True)
-        row.prop(g, "name", text="", emboss=False, icon="FILE_FOLDER")
-        try:
-            cnt = count_keys_in_group(key_data, g.name)
-        except Exception:
-            cnt = 0
-        row.label(text=str(cnt))
+        row.prop(
+            group,
+            "name",
+            text="",
+            emboss=False,
+            icon="FILE_FOLDER",
+        )
+        row.label(text=str(len(keys)))
+
+        visibility = row.row(align=True)
+        visibility.enabled = (
+            bool(keys)
+            and key_data.library is None
+        )
+
+        operator = visibility.operator(
+            "skv.group_toggle_visibility",
+            text="",
+            icon="HIDE_ON" if hidden else "HIDE_OFF",
+            emboss=False,
+        )
+        operator.group_name = group.name
 
 
 class SKV_UL_key_blocks(UIList):
@@ -915,7 +1000,7 @@ def _select_visible_from_list(operator, context, source):
     if not is_initialized(data):
         return {"CANCELLED"}
 
-    if operator.mode not in {"ALL", "CLEAR", "INVERT"}:
+    if operator.mode not in {"ALL", "CLEAR", "INVERT", "NONZERO"}:
         return {"CANCELLED"}
 
     names = skv_list_key_names(
@@ -935,11 +1020,13 @@ def _select_visible_from_list(operator, context, source):
         kd_activate_selection_source(data, source)
 
         for name in names:
-            state = (
-                True
-                if operator.mode == "ALL"
-                else not kd_is_selected(data, name)
-            )
+            if operator.mode == "ALL":
+                state = True
+            elif operator.mode == "NONZERO":
+                state = float(data.key_blocks[name].value) != 0.0
+            else:
+                state = not kd_is_selected(data, name)
+
             kd_set_selected(data, name, state)
 
     tag_redraw_view3d(context)
@@ -1967,6 +2054,7 @@ CLASSES = (
     SKV_OT_FavoritesSearchClear,
     SKV_MT_MoveToGroup,
     SKV_MT_SelectActions,
+    SKV_OT_GroupToggleVisibility,
     SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_AutoKeyframeToggle,
     SKV_OT_KeyToggleSelect,
