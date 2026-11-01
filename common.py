@@ -265,7 +265,7 @@ def kd_group_counts(key_data):
     counts = {}
 
     for kb in key_data.key_blocks:
-        if kb.name == "Basis":
+        if kb == key_data.key_blocks[0]:
             continue
         name = mapping.get(kb.name, fallback)
         counts[name] = counts.get(name, 0) + 1
@@ -356,11 +356,13 @@ def ensure_init_setup_write(obj):
 
 def _is_basis_name(key_data, name: str) -> bool:
     try:
-        if not key_data or not key_data.key_blocks:
-            return False
-        return key_data.key_blocks[0].name == name
-    except Exception:
-        return name == "Basis"
+        return bool(
+            key_data
+            and key_data.key_blocks
+            and key_data.key_blocks[0].name == name
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        return False
 
 
 _SKV_SHAPE_KEY_LIST_SYNC_GUARD = False
@@ -495,7 +497,11 @@ def skv_sync_shape_key_list_indices(context, obj, key_name: str = "", set_blende
                     gpreset = scene.skv_global_presets[preset_index]
                     item_index = -1
                     for i, it in enumerate(gpreset.items):
-                        if it.object_name == obj.name and it.key_name == key_name:
+                        item_obj = getattr(it, "object_ref", None)
+                        if (
+                                item_obj == obj
+                                or (item_obj is None and it.object_name == obj.name)
+                        ) and it.key_name == key_name:
                             item_index = i
                             break
                     gpreset.items_index = item_index
@@ -581,6 +587,21 @@ def skv_list_key_names(
         and all(token in kb.name.lower() for token in tokens)
     ]
 
+def kd_visible_selected_names(key_data, props):
+    if not key_data or not props:
+        return set()
+
+    source = getattr(key_data, "skv_selection_source", "GROUP")
+    selected = kd_selected_set(key_data)
+    visible = set(
+        skv_list_key_names(
+            key_data,
+            props,
+            source,
+            use_search=True,
+        )
+    )
+    return selected & visible
 
 def kd_activate_selection_source(key_data, source):
     # Keep selection owned by exactly one list.

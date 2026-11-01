@@ -39,6 +39,7 @@ from .common import (
     kd_prune_favorites,
     skv_list_key_names,
     kd_keyframed_names,
+    _is_basis_name,
 )
 from . import groups
 from . import presets
@@ -139,6 +140,11 @@ def _skv_reset_runtime_caches(*_args):
     _SKV_STRUCTURE_TOKEN = None
     _SKV_PRESET_SYNC_TOKEN = None
 
+    try:
+        presets.migrate_legacy_preset_object_refs()
+    except Exception:
+        pass
+
 
 def _shape_key_signature(obj) -> str:
     if not obj or getattr(obj, "type", None) != "MESH":
@@ -230,7 +236,11 @@ def _sync_shape_key_rename_mappings(scene, obj, key_data, previous_signature: st
             if scene and hasattr(scene, "skv_global_presets") and obj:
                 for preset in scene.skv_global_presets:
                     for it in preset.items:
-                        if it.object_name == obj.name and it.key_name == old_name:
+                        item_obj = getattr(it, "object_ref", None)
+                        if (
+                                item_obj == obj
+                                or (item_obj is None and it.object_name == obj.name)
+                        ) and it.key_name == old_name:
                             it.key_name = new_name
         except Exception:
             pass
@@ -398,64 +408,87 @@ def _depsgraph_update_post(scene, depsgraph):
         _sync_shape_key_sculpt_state(bpy.context)
         _auto_process_active_object(scene, updated_ids)
 
-        props = getattr(scene, "skv_props", None)
-        obj = (
-            getattr(props, "object_pick", None)
-            if props else None
-        ) or getattr(bpy.context, "active_object", None)
+        frame = int(scene.frame_current)
+        candidates = {}
 
-        if obj and obj.type == "MESH":
+        def add_candidate(obj):
+            if not obj or getattr(obj, "type", None) != "MESH":
+                return
+
             data = get_shape_key_data(obj)
-            entries = getattr(data, "skv_auto_keyframes", ())
-            enabled = [
-                item for item in entries if item.enabled
-            ]
+            if not data:
+                return
 
-            if (
-                    data
-                    and data.library is None
-                    and enabled
-                    and (
-                    updated_ids.intersection({
-                        _skv_pointer(obj),
-                        _skv_pointer(obj.data),
-                        _skv_pointer(data),
-                    })
-                    or any(
-                int(scene.frame_current) != item.last_frame
-                for item in enabled
-                    )
-                )
-            ):
-                keys = {
-                    kb.name: kb for kb in data.key_blocks
+            pointer = _skv_pointer(data)
+            if pointer not in candidates:
+                candidates[pointer] = {
+                    "data": data,
+                    "owner_ids": set(),
                 }
-                frame = int(scene.frame_current)
 
-                for item in enabled:
-                    kb = keys.get((item.name or "").strip())
-                    if kb is None:
-                        continue
+            candidates[pointer]["owner_ids"].update({
+                _skv_pointer(obj),
+                _skv_pointer(obj.data),
+                pointer,
+            })
 
-                    value = float(kb.value)
+        for obj in scene.objects:
+            add_candidate(obj)
 
-                    if frame != item.last_frame:
-                        item.last_frame = frame
-                        item.last_value = value
-                        continue
+        # Include preset objects even when they are not linked to this scene.
+        for preset in getattr(scene, "skv_global_presets", ()):
+            for item in preset.items:
+                add_candidate(presets.preset_item_object(item))
 
-                    if abs(value - item.last_value) > 1e-6:
-                        try:
-                            data.keyframe_insert(
-                                data_path=groups._shape_key_value_data_path(
-                                    kb.name
-                                ),
-                                frame=frame,
-                            )
-                        except RuntimeError:
-                            pass
+        for record in candidates.values():
+            data = record["data"]
+            if data.library is not None:
+                continue
 
-                        item.last_value = value
+            enabled = [
+                item
+                for item in getattr(data, "skv_auto_keyframes", ())
+                if item.enabled
+            ]
+            if not enabled:
+                continue
+
+            frame_changed = any(
+                frame != item.last_frame
+                for item in enabled
+            )
+            data_changed = bool(
+                updated_ids.intersection(record["owner_ids"])
+            )
+            if not frame_changed and not data_changed:
+                continue
+
+            keys = {kb.name: kb for kb in data.key_blocks}
+
+            for item in enabled:
+                kb = keys.get((item.name or "").strip())
+                if kb is None:
+                    continue
+
+                value = float(kb.value)
+
+                if frame != item.last_frame:
+                    item.last_frame = frame
+                    item.last_value = value
+                    continue
+
+                if abs(value - item.last_value) > 1e-6:
+                    try:
+                        data.keyframe_insert(
+                            data_path=groups._shape_key_value_data_path(
+                                kb.name
+                            ),
+                            frame=frame,
+                        )
+                    except RuntimeError:
+                        pass
+
+                    item.last_value = value
 
         preset = presets.get_active_global_preset(scene)
 
@@ -698,20 +731,19 @@ class SKV_OT_SynchronizeValues(Operator):
 
         changed = 0
 
-
         for src_kb in source_key_data.key_blocks:
-                if src_kb.name == "Basis":
-                    continue
+            if _is_basis_name(source_key_data, src_kb.name):
+                continue
 
-                dst_kb = target_key_data.key_blocks.get(src_kb.name)
-                if not dst_kb:
-                    continue
+            dst_kb = target_key_data.key_blocks.get(src_kb.name)
+            if not dst_kb:
+                continue
 
-                try:
-                    dst_kb.value = float(src_kb.value)
-                    changed += 1
-                except Exception:
-                    continue
+            try:
+                dst_kb.value = float(src_kb.value)
+                changed += 1
+            except Exception:
+                continue
 
         if changed == 0:
             self.report({"INFO"}, "No matching Shape Keys found")
@@ -1132,7 +1164,10 @@ class SKV_PT_ShapeKeysPanel(Panel):
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
 
         selected_names = set(kd_selected_set(key_data))
-        has_selected_valid = any(n and n != "Basis" for n in selected_names)
+        has_selected_valid = any(
+            n and not _is_basis_name(key_data, n)
+            for n in selected_names
+        )
         has_presets = hasattr(context.scene, "skv_global_presets") and (len(context.scene.skv_global_presets) > 0)
         groups_count = len(key_data.skv_groups) if getattr(key_data, "skv_groups", None) else 0
         can_move_to_group = groups_count > 1
@@ -1679,9 +1714,6 @@ _SKV_OPERATOR_DESCRIPTIONS = {
     "skv.group_move":
         "Move this group up or down in the group list",
 
-    "skv.group_rename":
-        "Rename the selected group",
-
     "skv.create_group_from_selected":
         "Create a group and move the selected shape keys into it",
 
@@ -1702,10 +1734,6 @@ _SKV_OPERATOR_DESCRIPTIONS = {
 
     "skv.keyframed_search_clear":
         "Clear the Keyframed Shape Keys search filter",
-
-
-    "skv.preset_capture_max_index":
-        "Save current shape key values as reference values for this preset",
 
     "skv.preset_item_capture_max":
         "Save this shape key's current value as its reference value in the preset",
@@ -1736,9 +1764,6 @@ _SKV_OPERATOR_DESCRIPTIONS = {
 
     "skv.global_preset_remove":
         "Remove this preset without deleting its shape keys",
-
-    "skv.global_preset_rename":
-        "Rename the selected preset",
 
     "skv.global_preset_add_from_selected":
         "Create a preset from the selected shape keys and their current values",

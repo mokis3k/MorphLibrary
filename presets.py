@@ -11,9 +11,11 @@ from bpy.props import (
     StringProperty,
     CollectionProperty,
     BoolProperty,
+    PointerProperty,
 )
 
 from .transfer import TransferModalMixin
+from .groups import _shape_key_value_data_path
 
 from .common import (
     get_active_object,
@@ -27,6 +29,7 @@ from .common import (
     skv_shape_key_list_sync_active,
     skv_sync_shape_key_list_indices,
     kd_autokf_get_entry as _autokf_get_entry,
+    kd_visible_selected_names
 )
 
 _PRESET_ITEM_SYNC_GUARD = False
@@ -90,17 +93,39 @@ def sync_preset_item_values(
         _PRESET_ITEM_SYNC_GUARD = previous_guard
 
 
+def preset_item_object(item):
+    obj = getattr(item, "object_ref", None)
+    if obj is not None:
+        return obj
+
+    # Resolve old files that only store object_name.
+    name = (getattr(item, "object_name", "") or "").strip()
+    return bpy.data.objects.get(name) if name else None
+
+
+def migrate_legacy_preset_object_refs():
+    for scene in bpy.data.scenes:
+        for preset in getattr(scene, "skv_global_presets", ()):
+            for item in preset.items:
+                if getattr(item, "object_ref", None) is not None:
+                    continue
+
+                name = (getattr(item, "object_name", "") or "").strip()
+                obj = bpy.data.objects.get(name) if name else None
+                if obj is not None:
+                    item.object_ref = obj
+
+
 def _preset_item_value_update(self, context):
     global _PRESET_ITEM_SYNC_GUARD
     if _PRESET_ITEM_SYNC_GUARD:
         return
 
-    obj_name = (self.object_name or "").strip()
     key_name = (self.key_name or "").strip()
-    if not obj_name or not key_name:
+    if not key_name:
         return
 
-    obj = bpy.data.objects.get(obj_name)
+    obj = preset_item_object(self)
     if not obj or getattr(obj, "type", None) != "MESH":
         return
 
@@ -177,16 +202,16 @@ def _iter_resolved_preset_items(preset, updated_ids=None):
     key_maps = {}
 
     for item in preset.items:
-        name = item.object_name
+        obj = preset_item_object(item)
+        if obj is None:
+            continue
 
-        if name not in objects:
-            obj = (
-                bpy.data.objects.get(name)
-                if name else None
-            )
+        object_pointer = obj.as_pointer()
+
+        if object_pointer not in objects:
             data = (
                 get_shape_key_data(obj)
-                if obj and obj.type == "MESH"
+                if obj.type == "MESH"
                 else None
             )
 
@@ -210,9 +235,9 @@ def _iter_resolved_preset_items(preset, updated_ids=None):
             else:
                 keys = {}
 
-            objects[name] = (data, keys)
+            objects[object_pointer] = (data, keys)
 
-        data, keys = objects[name]
+        data, keys = objects[object_pointer]
         kb = keys.get(item.key_name)
 
         if kb is not None:
@@ -253,7 +278,7 @@ def _preset_all_autokey_enabled(preset) -> bool:
 
 
 def preset_item_capture_max_enabled(it) -> bool:
-    obj = bpy.data.objects.get(it.object_name) if getattr(it, "object_name", "") else None
+    obj = preset_item_object(it)
     if not obj or getattr(obj, "type", None) != "MESH":
         return False
 
@@ -275,7 +300,12 @@ def iter_preset_items_grouped(preset):
     grouped = {}
     order = []
     for idx, it in enumerate(getattr(preset, "items", [])):
-        obj_name = (it.object_name or "").strip()
+        obj = preset_item_object(it)
+        obj_name = (
+            obj.name
+            if obj is not None
+            else (it.object_name or "").strip()
+        )
         if not obj_name:
             obj_name = "Unknown Object"
         if obj_name not in grouped:
@@ -320,10 +350,11 @@ def add_shape_key_to_preset(preset, obj, key_name: str):
         return False
 
     for it in preset.items:
-        if it.object_name == obj.name and it.key_name == key_name:
+        if preset_item_object(it) == obj and it.key_name == key_name:
             return False
 
     it = preset.items.add()
+    it.object_ref = obj
     it.object_name = obj.name
     it.key_name = key_name
     it.object_open = True
@@ -352,7 +383,8 @@ def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> in
         source_keys_in_preset = {
             it.key_name
             for it in preset.items
-            if it.object_name == source_obj.name and it.key_name in selected_names
+            if preset_item_object(it) == source_obj
+            and it.key_name in selected_names
         }
         if not source_keys_in_preset:
             continue
@@ -365,6 +397,10 @@ def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> in
 
 
 class SKV_GlobalPresetItem(PropertyGroup):
+    object_ref: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+    )
     object_name: StringProperty(name="Object", default="")
     key_name: StringProperty(name="Shape Key", default="")
     object_open: BoolProperty(name="Object Open", default=True)
@@ -393,7 +429,7 @@ def global_preset_items_index_update(self, context):
         return
 
     it = gpreset.items[idx]
-    obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+    obj = preset_item_object(it)
     if not obj or getattr(obj, "type", None) != "MESH":
         return
 
@@ -448,39 +484,6 @@ class SKV_GlobalPreset(PropertyGroup):
     )
 
 
-class SKV_OT_preset_capture_max_index(Operator):
-    bl_idname = "skv.preset_capture_max_index"
-    bl_label = "Capture Max (Index)"
-    bl_options = {"REGISTER", "UNDO"}
-
-    preset_index: IntProperty(name="Preset Index", default=0)
-
-    def execute(self, context):
-        scene = context.scene
-        idx = int(self.preset_index)
-        if idx < 0 or idx >= len(scene.skv_global_presets):
-            return {"CANCELLED"}
-        preset = scene.skv_global_presets[idx]
-
-        for it in preset.items:
-            obj = bpy.data.objects.get(it.object_name) if it.object_name else None
-            if not obj:
-                continue
-            key_data = get_shape_key_data(obj)
-            if not key_data or not getattr(key_data, "key_blocks", None):
-                continue
-            kb = key_data.key_blocks.get(it.key_name)
-            if not kb:
-                continue
-            try:
-                it.max_value = float(kb.value)
-            except Exception:
-                pass
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
 class SKV_OT_preset_item_capture_max(Operator):
     bl_idname = "skv.preset_item_capture_max"
     bl_label = "Capture Max (Item)"
@@ -500,7 +503,7 @@ class SKV_OT_preset_item_capture_max(Operator):
 
         it = preset.items[idx]
 
-        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+        obj = preset_item_object(it)
         if not obj or getattr(obj, "type", None) != "MESH":
             return {"CANCELLED"}
 
@@ -560,10 +563,17 @@ class SKV_OT_preset_object_remove(Operator):
         if preset is None or not self.object_name:
             return {"CANCELLED"}
 
-        indices = [
-            index for index, item in enumerate(preset.items)
-            if item.object_name == self.object_name
-        ]
+        indices = []
+        for index, item in enumerate(preset.items):
+            obj = preset_item_object(item)
+            if (
+                (obj is not None and obj.name == self.object_name)
+                or (
+                    obj is None
+                    and item.object_name == self.object_name
+                )
+            ):
+                indices.append(index)
         if not indices:
             return {"CANCELLED"}
 
@@ -679,7 +689,7 @@ class SKV_OT_preset_object_transfer(
         source_max = {
             item.key_name: float(item.max_value)
             for item in preset.items
-            if item.object_name == source.name
+            if preset_item_object(item) == source
         }
         names = [
             kb.name for kb in source_data.key_blocks
@@ -779,13 +789,16 @@ class SKV_OT_preset_object_transfer(
         for name in resolved:
             add_shape_key_to_preset(preset, target, name)
             for item in preset.items:
-                if item.object_name == target.name and item.key_name == name:
+                if (
+                    preset_item_object(item) == target
+                    and item.key_name == name
+                ):
                     item.max_value = source_max[name]
                     break
 
         copied = 0
         if target_data != source_data:
-            # Isolate shared target actions before replacing their FCurves.
+            # Isolate shared target actions before adding missing FCurves.
             anim = getattr(target_data, "animation_data", None)
             action = getattr(anim, "action", None) if anim else None
 
@@ -882,7 +895,7 @@ class SKV_OT_preset_toggle_auto_keyframe(Operator):
 
                 if target_enabled:
                     try:
-                        key_data.keyframe_insert(data_path=f'key_blocks["{kb.name}"].value', frame=frame)
+                        key_data.keyframe_insert(data_path=_shape_key_value_data_path(kb.name), frame=frame)
                     except Exception:
                         pass
 
@@ -933,7 +946,9 @@ class SKV_UL_global_preset_key_sliders(UIList):
         bitflag = self.bitflag_filter_item
 
         for it in items:
-            if not target or (it.object_name == target):
+            obj = preset_item_object(it)
+            item_object_name = obj.name if obj else it.object_name
+            if not target or item_object_name == target:
                 flt_flags.append(bitflag)
             else:
                 flt_flags.append(0)
@@ -945,7 +960,7 @@ class SKV_UL_global_preset_key_sliders(UIList):
         row = layout.row(align=True)
 
         kb = None
-        obj = bpy.data.objects.get(it.object_name) if it.object_name else None
+        obj = preset_item_object(it)
         if obj and getattr(obj, "type", None) == "MESH":
             key_data = get_shape_key_data(obj)
             if key_data and getattr(key_data, "key_blocks", None):
@@ -1027,7 +1042,10 @@ class SKV_OT_add_selected_to_preset(Operator):
 
         ensure_init_setup_write(obj)
 
-        selected = kd_selected_set(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
         selected = [n for n in selected if n and not _is_basis_name(key_data, n)]
         if not selected:
             self.report({"INFO"}, "No selected shape keys.")
@@ -1060,11 +1078,6 @@ class SKV_OT_GlobalPresetAddEmpty(Operator):
     def execute(self, context):
         scene = context.scene
 
-        try:
-            scene.skv_props.skip_next_object_sync = True
-        except Exception:
-            pass
-
         preset = scene.skv_global_presets.add()
         preset.name = _make_unique_preset_name(scene, "Preset")
         preset.value = 0.0
@@ -1090,30 +1103,6 @@ class SKV_OT_GlobalPresetRemove(Operator):
         if 0 <= idx < len(scene.skv_global_presets):
             scene.skv_global_presets.remove(idx)
             scene.skv_global_preset_index = max(0, min(idx, len(scene.skv_global_presets) - 1))
-            tag_redraw_view3d(context)
-            return {"FINISHED"}
-        return {"CANCELLED"}
-
-
-class SKV_OT_GlobalPresetRename(Operator):
-    bl_idname = "skv.global_preset_rename"
-    bl_label = "Rename Preset"
-    bl_options = {"REGISTER", "UNDO"}
-
-    new_name: StringProperty(name="New Name", default="Preset")
-
-    def invoke(self, context, event):
-        scene = context.scene
-        idx = int(getattr(scene, "skv_global_preset_index", 0))
-        if 0 <= idx < len(scene.skv_global_presets):
-            self.new_name = scene.skv_global_presets[idx].name
-        return context.window_manager.invoke_props_dialog(self)
-
-    def execute(self, context):
-        scene = context.scene
-        idx = int(getattr(scene, "skv_global_preset_index", 0))
-        if 0 <= idx < len(scene.skv_global_presets):
-            scene.skv_global_presets[idx].name = (self.new_name or "Preset").strip() or "Preset"
             tag_redraw_view3d(context)
             return {"FINISHED"}
         return {"CANCELLED"}
@@ -1145,7 +1134,10 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
             self.report({"INFO"}, "Not initialized.")
             return {"CANCELLED"}
 
-        selected = kd_selected_set(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
         if not selected:
             self.report({"INFO"}, "Select shape keys first (Select mode).")
             return {"CANCELLED"}
@@ -1185,7 +1177,6 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
 CLASSES = (
     SKV_GlobalPresetItem,
     SKV_GlobalPreset,
-    SKV_OT_preset_capture_max_index,
     SKV_OT_preset_object_transfer,
     SKV_OT_preset_item_capture_max,
     SKV_OT_preset_object_select,
@@ -1199,6 +1190,5 @@ CLASSES = (
     SKV_OT_add_selected_to_preset,
     SKV_OT_GlobalPresetAddEmpty,
     SKV_OT_GlobalPresetRemove,
-    SKV_OT_GlobalPresetRename,
     SKV_OT_GlobalPresetAddFromSelected,
 )

@@ -43,6 +43,8 @@ from .common import (
     SKV_ROW_SELECTED,
     SKV_ROW_FAVORITE,
     SKV_ROW_AUTO_KEYFRAME,
+    kd_visible_selected_names,
+    _is_basis_name,
 )
 
 
@@ -105,11 +107,12 @@ def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
     if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
         return 0
 
-    names = [n for n in (key_names or []) if n and n != "Basis"]
+    source_key_data = get_shape_key_data(source_obj)
+
+    names = [n for n in (key_names or []) if n and not _is_basis_name(source_key_data, n)]
     if not names:
         return 0
 
-    source_key_data = get_shape_key_data(source_obj)
     target_key_data = get_shape_key_data(target_obj)
 
     if not source_key_data or not target_key_data:
@@ -167,9 +170,7 @@ def _remove_empty_transfer_fallback_group(target_key_data) -> None:
     if fallback_index < 0:
         return
 
-    for kb in getattr(target_key_data, "key_blocks", []) or []:
-        if kb.name == "Basis":
-            continue
+    for kb in list(getattr(target_key_data, "key_blocks", []) or [])[1:]:
         if kd_get_group(target_key_data, kb.name) == INIT_GROUP_NAME:
             return
 
@@ -479,6 +480,27 @@ def _action_fcurves_new(action, datablock, data_path: str, index: int = 0, group
         return None
 
 
+def _activate_target_if_available(context, target):
+    view_layer = getattr(context, "view_layer", None)
+    if not view_layer or not target:
+        return False
+
+    layer_target = view_layer.objects.get(target.name)
+    if layer_target != target:
+        return False
+
+    try:
+        for obj in view_layer.objects:
+            if obj.select_get():
+                obj.select_set(False)
+
+        target.select_set(True)
+        view_layer.objects.active = target
+        return True
+    except (RuntimeError, TypeError):
+        return False
+
+
 def _copy_keyframe_point(dst_kp, src_kp) -> None:
     # Copy keyframe point settings.
     try:
@@ -519,8 +541,8 @@ def _copy_fcurve_keyframes(src_fc, dst_action, dst_datablock, dst_data_path: str
             dst_data_path,
             index=int(getattr(src_fc, "array_index", 0)),
         )
-        if existing:
-            _action_fcurves_remove(dst_action, dst_datablock, existing)
+        if existing is not None:
+            return False
     except Exception:
         pass
 
@@ -638,10 +660,15 @@ def _group_shape_keys(key_data, group_name):
     if not key_data or not key_data.key_blocks:
         return []
 
+    # Build the name -> group map once: kd_get_group() does a linear
+    # collection lookup per call, which made this O(n^2) per UI row.
+    mapping = kd_group_map(key_data)
+    fallback = get_fallback_group_name(key_data)
+
     return [
         kb
         for kb in list(key_data.key_blocks)[1:]
-        if kd_get_group(key_data, kb.name) == group_name
+        if mapping.get(kb.name, fallback) == group_name
     ]
 
 
@@ -710,12 +737,8 @@ class SKV_UL_Groups(UIList):
         group = item
         key_data = data
 
-        try:
-            if not getattr(group, "last_name", ""):
-                group.last_name = group.name
-        except Exception:
-            pass
-
+        # Writing ID data from draw() is not allowed in Blender (it always
+        # raised and was silently swallowed), so last_name is no longer set here.
         keys = _group_shape_keys(key_data, group.name)
         hidden = bool(keys) and all(kb.mute for kb in keys)
 
@@ -868,15 +891,6 @@ class SKV_MT_MoveToGroup(Menu):
             layout.label(text="No other groups")
 
 
-class SKV_MT_SelectActions(Menu):
-    bl_label = "Actions"
-    bl_idname = "SKV_MT_select_actions"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="Not used (actions are displayed inline).")
-
-
 # -----------------------------
 # Operators (required by CLASSES)
 # -----------------------------
@@ -938,7 +952,7 @@ class SKV_OT_AutoKeyframeToggle(Operator):
 
         if entry.enabled:
             try:
-                key_data.keyframe_insert(data_path=f'key_blocks["{name}"].value', frame=frame)
+                key_data.keyframe_insert(data_path=_shape_key_value_data_path(name), frame=frame)
             except Exception:
                 pass
 
@@ -1069,9 +1083,12 @@ class SKV_OT_MoveSelectedToGroup(Operator):
             return {"CANCELLED"}
 
         group_name = (self.group or INIT_GROUP_NAME).strip() or INIT_GROUP_NAME
-        selected = kd_selected_set(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
         for n in selected:
-            if n and n != "Basis":
+            if n and not _is_basis_name(key_data, n):
                 kd_set_group(key_data, n, group_name)
 
         tag_redraw_view3d(context)
@@ -1103,7 +1120,10 @@ class SKV_OT_ResetGroupValues(Operator):
 
         ensure_init_setup_write(obj)
 
-        selected = kd_selected_set(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
         group_name = get_selected_group_name(key_data)
         mapping = kd_group_map(key_data)
         fallback = get_fallback_group_name(key_data)
@@ -1156,10 +1176,10 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
 
         group_name = get_selected_group_name(key_data)
         source = key_data.skv_selection_source
-        selected = kd_selected_set(key_data)
-
-        if source == "FAVORITES":
-            selected &= kd_favorite_names(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
 
         basis_name = key_data.key_blocks[0].name
 
@@ -1226,7 +1246,17 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
                 changed = False
                 for index in range(len(preset.items) - 1, -1, -1):
                     item = preset.items[index]
-                    if item.object_name in owner_names and item.key_name in deleted:
+                    item_obj = getattr(item, "object_ref", None)
+                    if (
+                            (
+                                    item_obj is not None
+                                    and item_obj.name in owner_names
+                            )
+                            or (
+                                    item_obj is None
+                                    and item.object_name in owner_names
+                            )
+                    ) and item.key_name in deleted:
                         preset.items.remove(index)
                         changed = True
                 if changed:
@@ -1429,70 +1459,6 @@ class SKV_OT_GroupMove(Operator):
         return {"FINISHED"}
 
 
-class SKV_OT_GroupRename(Operator):
-    bl_idname = "skv.group_rename"
-    bl_label = "Rename Group"
-    bl_options = {"REGISTER", "UNDO"}
-
-    new_name: StringProperty(name="New Name", default="")
-
-    def invoke(self, context, event):
-        obj = get_active_object(context)
-        if not obj:
-            return {"CANCELLED"}
-
-        key_data = get_shape_key_data(obj)
-        if not key_data or not has_group_storage(key_data) or not is_initialized(key_data):
-            return {"CANCELLED"}
-
-        idx = int(key_data.skv_group_index)
-        if 0 <= idx < len(key_data.skv_groups):
-            self.new_name = key_data.skv_groups[idx].name
-        return context.window_manager.invoke_props_dialog(self)
-
-    def execute(self, context):
-        obj = get_active_object(context)
-        if not obj:
-            self.report({"WARNING"}, "No supported active object.")
-            return {"CANCELLED"}
-
-        key_data = get_shape_key_data(obj)
-        if not key_data or not has_group_storage(key_data):
-            return {"CANCELLED"}
-
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        ensure_init_setup_write(obj)
-
-        idx = int(key_data.skv_group_index)
-        if not (0 <= idx < len(key_data.skv_groups)):
-            return {"CANCELLED"}
-
-        old = key_data.skv_groups[idx].name
-
-        new = self.new_name.strip()
-        if not new:
-            self.report({"WARNING"}, "Group name is empty.")
-            return {"CANCELLED"}
-
-        names = group_names(key_data)
-        if new in names and new != old:
-            self.report({"WARNING"}, "Group with this name already exists.")
-            return {"CANCELLED"}
-
-        key_data.skv_groups[idx].name = new
-        key_data.skv_groups[idx].last_name = new
-
-        for kb in key_data.key_blocks:
-            if kd_get_group(key_data, kb.name) == old:
-                kd_set_group(key_data, kb.name, new)
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
 class SKV_OT_CreateGroupFromSelected(Operator):
     bl_idname = "skv.create_group_from_selected"
     bl_label = "Create Group From Selected"
@@ -1523,7 +1489,10 @@ class SKV_OT_CreateGroupFromSelected(Operator):
 
         ensure_init_setup_write(obj)
 
-        selected = kd_selected_set(key_data)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
         if not selected:
             self.report({"INFO"}, "No selected shape keys.")
             return {"CANCELLED"}
@@ -1615,8 +1584,11 @@ class SKV_OT_TransferTo(TransferModalMixin, Operator):
         if not key_data or not getattr(key_data, "key_blocks", None):
             return False
 
-        selected = kd_selected_set(key_data)
-        return any(name != "Basis" for name in selected)
+        selected = kd_visible_selected_names(
+            key_data,
+            context.scene.skv_props,
+        )
+        return any(not _is_basis_name(key_data, name) for name in selected)
 
     def execute(self, context):
         from .transfer import Transfer
@@ -1644,8 +1616,11 @@ class SKV_OT_TransferTo(TransferModalMixin, Operator):
         key_data = get_shape_key_data(source)
         selected_names = [
             name
-            for name in kd_selected_set(key_data)
-            if name != "Basis"
+            for name in kd_visible_selected_names(
+                key_data,
+                context.scene.skv_props,
+            )
+            if not _is_basis_name(key_data, name)
         ]
 
         if not selected_names:
@@ -1734,7 +1709,7 @@ class SKV_OT_TransferTo(TransferModalMixin, Operator):
         except Exception:
             pass
 
-        view_layer.objects.active = target
+        _activate_target_if_available(context, target)
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -1766,7 +1741,7 @@ class SKV_OT_TransferFrom(TransferModalMixin, Operator):
         target_has_shape_keys = bool(
             target_key_data
             and getattr(target_key_data, "key_blocks", None)
-            and any(kb.name != "Basis" for kb in target_key_data.key_blocks)
+            and bool(list(target_key_data.key_blocks)[1:])
         )
 
         if target_has_shape_keys:
@@ -1803,7 +1778,10 @@ class SKV_OT_TransferFrom(TransferModalMixin, Operator):
             self.report({"ERROR"}, "Source has no Shape Keys")
             return {"CANCELLED"}
 
-        selected_names = [kb.name for kb in source_key_data.key_blocks if kb.name != "Basis"]
+        selected_names = [
+            kb.name
+            for kb in source_key_data.key_blocks[1:]
+        ]
 
         if not selected_names:
             self.report({"ERROR"}, "Source has no transferable Shape Keys")
@@ -1872,7 +1850,7 @@ class SKV_OT_TransferFrom(TransferModalMixin, Operator):
         except Exception:
             pass
 
-        view_layer.objects.active = target
+        _activate_target_if_available(context, target)
 
         tag_redraw_view3d(context)
         return {"FINISHED"}
@@ -2053,7 +2031,6 @@ CLASSES = (
     SKV_OT_FavoritesClear,
     SKV_OT_FavoritesSearchClear,
     SKV_MT_MoveToGroup,
-    SKV_MT_SelectActions,
     SKV_OT_GroupToggleVisibility,
     SKV_OT_ShapeKeyToggleVisibility,
     SKV_OT_AutoKeyframeToggle,
@@ -2066,7 +2043,6 @@ CLASSES = (
     SKV_OT_GroupAdd,
     SKV_OT_GroupRemove,
     SKV_OT_GroupMove,
-    SKV_OT_GroupRename,
     SKV_OT_CreateGroupFromSelected,
     SKV_OT_TransferTo,
     SKV_OT_TransferFrom,
