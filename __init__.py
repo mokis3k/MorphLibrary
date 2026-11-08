@@ -140,11 +140,15 @@ def _skv_reset_runtime_caches(*_args):
     _SKV_STRUCTURE_TOKEN = None
     _SKV_PRESET_SYNC_TOKEN = None
 
+@persistent
+def _skv_load_post(*_args):
+    _skv_reset_runtime_caches()
+
     try:
         presets.migrate_legacy_preset_object_refs()
-    except Exception:
-        pass
-
+        presets.prepare_preset_metadata()
+    except Exception as exc:
+        print("MorphDeck: preset metadata preparation failed:", exc)
 
 def _shape_key_signature(obj) -> str:
     if not obj or getattr(obj, "type", None) != "MESH":
@@ -518,6 +522,20 @@ def _depsgraph_update_post(scene, depsgraph):
         _SKV_DEPSGRAPH_GUARD = False
 
 
+# [ANIM-FIX] Новый обработчик смены кадра.
+# Причина бага: F-кривая пишет значение в свойство напрямую и НЕ вызывает
+# update=-колбэк, поэтому анимированный слайдер пресета не двигал шейпкеи.
+# Здесь на каждом кадре анимированные пресеты применяются вручную.
+@persistent
+def _frame_change_post(scene, depsgraph=None):
+    if transfer.is_transfer_running():
+        return
+    try:
+        presets.apply_animated_presets(scene)
+    except Exception as exc:
+        print("MorphDeck: animated preset apply failed:", exc)
+
+
 def _ensure_handler_installed():
     _skv_reset_runtime_caches()
 
@@ -527,9 +545,13 @@ def _ensure_handler_installed():
             handlers.depsgraph_update_post,
             _depsgraph_update_post,
         ),
+        (  # [ANIM-FIX] новая привязка обработчика смены кадра
+            handlers.frame_change_post,
+            _frame_change_post,
+        ),
         (
             handlers.load_post,
-            _skv_reset_runtime_caches,
+            _skv_load_post,
         ),
         (
             handlers.undo_post,
@@ -553,9 +575,13 @@ def _ensure_handler_removed():
             handlers.depsgraph_update_post,
             _depsgraph_update_post,
         ),
+        (  # [ANIM-FIX] новая привязка обработчика смены кадра
+            handlers.frame_change_post,
+            _frame_change_post,
+        ),
         (
             handlers.load_post,
-            _skv_reset_runtime_caches,
+            _skv_load_post,
         ),
         (
             handlers.undo_post,
@@ -1572,8 +1598,72 @@ class SKV_PT_PresetsPanel(Panel):
             col.operator("skv.global_preset_remove", icon="REMOVE", text="")
 
         gpreset = presets.get_active_global_preset(scene)
+
         if gpreset:
-            grouped_items = list(presets.iter_preset_items_grouped(gpreset))
+            control_box = presets_col.box()
+            found = presets.find_preset_control(gpreset)
+
+            if found is None:
+                control_box.label(
+                    text=(
+                        "Missing Control Owner"
+                        if gpreset.control_uid
+                        else "No Preset Control"
+                    ),
+                    icon="ERROR" if gpreset.control_uid else "INFO",
+                )
+                control_box.operator(
+                    "skv.control_restore",
+                    text="Create Control on Active Object",
+                )
+
+            else:
+                owner, ctrl = found
+                control_box.label(
+                    text=f"Control owner: {owner.name}",
+                    icon="SHAPEKEY_DATA",
+                )
+
+                users = list(
+                    presets._control_users(owner, ctrl.name)
+                )
+
+                if len(users) > 1:
+                    control_box.label(
+                        text=f"Shared by {len(users)} presets",
+                        icon="INFO",
+                    )
+
+                row = control_box.row(align=True)
+                row.operator(
+                    "skv.control_move",
+                    text="Move Control",
+                )
+                row.operator(
+                    "skv.control_independent",
+                    text="Make Independent",
+                )
+
+            control_box.operator(
+                "skv.control_migrate",
+                text="Migrate Scene Preset Animation",
+            )
+
+            overlaps = presets.preset_overlap_names(scene, gpreset)
+            if overlaps:
+                control_box.label(
+                    text="Shared shape keys with:",
+                    icon="INFO",
+                )
+                for name in overlaps:
+                    control_box.label(text=name)
+                control_box.label(
+                    text="Last applied preset in the list has priority."
+                )
+
+            grouped_items = list(
+                presets.iter_preset_items_grouped(gpreset)
+            )
             if grouped_items:
                 presets_col.separator()
                 presets_col.label(text=f"Shape Keys in {preset_name}")
@@ -1853,6 +1943,13 @@ def register():
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
 
     bpy.types.Scene.skv_global_presets = CollectionProperty(type=presets.SKV_GlobalPreset)
+    # [ANIM-FIX] Новое свойство на шейпкеях (Key): анимируемые слайдеры пресетов.
+    # Раньше анимировался Scene.skv_global_presets[i].value -> ключи шли в сцену.
+    bpy.types.Key.skv_preset_controls = CollectionProperty(type=presets.SKV_PresetControl)
+    bpy.types.Scene.skv_control_schema_version = IntProperty(
+        name="Preset Control Schema Version",
+        default=0,
+    )
     bpy.types.Scene.skv_global_preset_index = IntProperty(
         name="Preset Index",
         default=0,
@@ -1915,6 +2012,7 @@ def register():
 
 
     _ensure_handler_installed()
+    _skv_load_post()
     try:
         scene = bpy.context.scene
     except Exception:
@@ -1952,8 +2050,12 @@ def unregister():
 
     if hasattr(bpy.types.Scene, "skv_global_preset_index"):
         del bpy.types.Scene.skv_global_preset_index
+    if hasattr(bpy.types.Scene, "skv_control_schema_version"):
+        del bpy.types.Scene.skv_control_schema_version
     if hasattr(bpy.types.Scene, "skv_global_presets"):
         del bpy.types.Scene.skv_global_presets
+    if hasattr(bpy.types.Key, "skv_preset_controls"):  # [ANIM-FIX]
+        del bpy.types.Key.skv_preset_controls
 
     del bpy.types.Scene.skv_props
 
