@@ -1016,10 +1016,34 @@ class SKV_UL_global_presets(UIList):
         # Стало: рисуем слайдер контрола на объекте, чтобы ключ (I) писался
         # в объект, а не в сцену. Если контрола нет — старый слайдер.
         found = find_preset_control(preset)
-        if found is not None:
-            row.prop(found[1], "value", text="", slider=True)
+        legacy = preset_has_legacy_animation(context.scene, preset)
+
+        value_row = row.row(align=True)
+        value_row.enabled = bool(preset.items) and (
+            found is not None or legacy
+        )
+
+        if legacy:
+            value_row.prop(
+                preset,
+                "value",
+                text="",
+                slider=True,
+            )
+        elif found is not None:
+            value_row.prop(
+                found[1],
+                "value",
+                text="",
+                slider=True,
+            )
         else:
-            row.prop(preset, "value", text="", slider=True)
+            value_row.prop(
+                preset,
+                "value",
+                text="",
+                slider=True,
+            )
 
         vis_icon = "HIDE_ON" if _preset_all_muted(preset) else "HIDE_OFF"
         opv = row.operator("skv.preset_toggle_visibility", text="", icon=vis_icon, emboss=False)
@@ -1072,7 +1096,14 @@ class SKV_UL_global_preset_key_sliders(UIList):
         else:
             row.label(text=it.key_name or "Invalid", icon="ERROR")
 
-        row.prop(it, "value", text="", slider=True)
+        value_row = row.row(align=True)
+
+        if kb is not None:
+            value_row.enabled = key_data.library is None
+            value_row.prop(kb, "value", text="", slider=True)
+        else:
+            value_row.enabled = False
+            value_row.prop(it, "value", text="", slider=True)
 
         op_row = row.row(align=True)
         op_row.enabled = preset_item_capture_max_enabled(it)
@@ -2522,6 +2553,30 @@ def remove_scene_preset_animation(scene, preset):
 
     _edit_collection_animation(scene, paths, rewrite)
 
+def preset_has_legacy_animation(scene, preset):
+    """Check whether the preset still has scene-level animation."""
+    paths = _scene_preset_paths(scene, preset)
+    return bool(_matching_curves(scene, paths))
+
+
+def scene_has_legacy_preset_animation(scene):
+    """Check all presets without modifying their animation."""
+    return any(
+        preset_has_legacy_animation(scene, preset)
+        for preset in scene.skv_global_presets
+    )
+
+
+def preset_control_candidate(preset):
+    """Choose a local owner from the preset's existing objects."""
+    return next(
+        (
+            key
+            for key in _preset_keys(preset)
+            if key.library is None
+        ),
+        None,
+    )
 
 def _animation_snapshot(scene, preset):
     found = find_preset_control(preset)
@@ -2683,20 +2738,12 @@ def migrate_scene_preset_animation(scene):
                     raise RuntimeError("The control already has animation.")
 
             else:
-                if preset.control_uid:
-                    raise RuntimeError("The original control is missing.")
-
-                key = next(
-                    (
-                        candidate
-                        for candidate in _preset_keys(preset)
-                        if candidate.library is None
-                    ),
-                    None,
-                )
+                key = preset_control_candidate(preset)
 
                 if key is None:
-                    raise RuntimeError("No writable control owner is available.")
+                    raise RuntimeError(
+                        "No writable control owner is available."
+                    )
 
             with ControlTransaction(scene, [key]):
                 found = find_preset_control(preset)
@@ -2866,10 +2913,10 @@ def preset_overlap_names(scene, preset):
 
 class SKV_OT_ControlMigrate(Operator):
     bl_idname = "skv.control_migrate"
-    bl_label = "Migrate Preset Animation"
+    bl_label = "Update Preset Animation"
     bl_description = (
-        "Move supported preset animation from the scene "
-        "to shape key controls"
+        "Update legacy scene-level animation for all presets "
+        "in this scene; unsupported animation is kept unchanged"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -2891,124 +2938,92 @@ class SKV_OT_ControlMigrate(Operator):
         return {"FINISHED"}
 
 
-class SKV_OT_ControlMove(Operator):
-    bl_idname = "skv.control_move"
-    bl_label = "Move Preset Control"
-    bl_description = (
-        "Move the preset control and supported active-Action animation "
-        "to another object's shape keys"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    target: PointerProperty(
-        name="Target",
-        type=bpy.types.Object,
-        poll=lambda self, obj: (
-            obj.type == "MESH"
-            and get_shape_key_data(obj) is not None
-        ),
-    )
-
-    def invoke(self, context, event):
-        self.target = context.active_object
-        return context.window_manager.invoke_props_dialog(self, width=400)
-
-    def draw(self, context):
-        self.layout.prop(self, "target")
-
-    def execute(self, context):
-        preset = get_active_global_preset(context.scene)
-        key = get_shape_key_data(self.target)
-
-        if preset is None or key is None:
-            self.report({"ERROR"}, "Choose an object with shape keys.")
-            return {"CANCELLED"}
-
-        try:
-            relocate_preset_control(context.scene, preset, key)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            # Preserve an undo step if Action isolation already occurred.
-            return {"FINISHED"}
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
-class SKV_OT_ControlIndependent(Operator):
-    bl_idname = "skv.control_independent"
-    bl_label = "Make Preset Control Independent"
-    bl_description = (
-        "Create a separate control and copy supported animation "
-        "for this preset"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        preset = get_active_global_preset(context.scene)
-        found = find_preset_control(preset) if preset else None
-
-        if found is None:
-            self.report({"ERROR"}, "The control is missing.")
-            return {"CANCELLED"}
-
-        try:
-            relocate_preset_control(
-                context.scene,
-                preset,
-                found[0],
-                independent=True,
-            )
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"FINISHED"}
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
-
-
 class SKV_OT_ControlRestore(Operator):
     bl_idname = "skv.control_restore"
-    bl_label = "Create Preset Control"
+    bl_label = "Restore Preset Control"
     bl_description = (
-        "Create a control on the active object's shape keys; "
-        "lost animation is not recovered"
+        "Restore preset control using an available object "
+        "from this preset; deleted animation is not recovered"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=400)
+        preset = get_active_global_preset(context.scene)
+
+        if preset is None:
+            return {"CANCELLED"}
+
+        if find_preset_control(preset) is not None:
+            self.report({"INFO"}, "Preset control is already available.")
+            return {"CANCELLED"}
+
+        if preset_has_legacy_animation(context.scene, preset):
+            self.report(
+                {"INFO"},
+                "Update the legacy preset animation first.",
+            )
+            return {"CANCELLED"}
+
+        if preset_control_candidate(preset) is None:
+            self.report(
+                {"ERROR"},
+                "The preset needs an available local object with shape keys.",
+            )
+            return {"CANCELLED"}
+
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=420,
+        )
 
     def draw(self, context):
         self.layout.label(
-            text="Create a control on the active object?"
+            text="Restore control using an object from this preset?"
         )
         self.layout.label(
-            text="This does not recover deleted animation.",
-            icon="INFO",
+            text="Deleted animation will not be recovered.",
+            icon="ERROR",
         )
 
     def execute(self, context):
-        preset = get_active_global_preset(context.scene)
-        key = get_shape_key_data(context.active_object)
+        scene = context.scene
+        preset = get_active_global_preset(scene)
 
-        if preset is None or key is None:
-            self.report({"ERROR"}, "Select an object with shape keys.")
+        if preset is None:
+            return {"CANCELLED"}
+
+        if find_preset_control(preset) is not None:
+            self.report({"INFO"}, "Preset control is already available.")
+            return {"CANCELLED"}
+
+        if preset_has_legacy_animation(scene, preset):
+            self.report(
+                {"INFO"},
+                "Update the legacy preset animation first.",
+            )
+            return {"CANCELLED"}
+
+        key = preset_control_candidate(preset)
+        if key is None:
+            self.report(
+                {"ERROR"},
+                "The preset needs an available local object with shape keys.",
+            )
             return {"CANCELLED"}
 
         try:
-            restore_missing_control(preset, key)
+            with ControlTransaction(scene, [key]):
+                restore_missing_control(preset, key)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"FINISHED"}
 
+        self.report({"INFO"}, "Preset control restored.")
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
 
 CLASSES += (
     SKV_OT_ControlMigrate,
-    SKV_OT_ControlMove,
-    SKV_OT_ControlIndependent,
     SKV_OT_ControlRestore,
 )

@@ -1599,65 +1599,62 @@ class SKV_PT_PresetsPanel(Panel):
 
         gpreset = presets.get_active_global_preset(scene)
 
+        if presets.scene_has_legacy_preset_animation(scene):
+            legacy_box = presets_col.box()
+            legacy_box.label(
+                text="Legacy preset animation detected.",
+                icon="INFO",
+            )
+            legacy_box.operator(
+                "skv.control_migrate",
+                text="Update Preset Animation",
+            )
+
         if gpreset:
-            control_box = presets_col.box()
             found = presets.find_preset_control(gpreset)
+            legacy = presets.preset_has_legacy_animation(
+                scene,
+                gpreset,
+            )
 
-            if found is None:
-                control_box.label(
-                    text=(
-                        "Missing Control Owner"
-                        if gpreset.control_uid
-                        else "No Preset Control"
-                    ),
-                    icon="ERROR" if gpreset.control_uid else "INFO",
-                )
-                control_box.operator(
-                    "skv.control_restore",
-                    text="Create Control on Active Object",
+            if not gpreset.items:
+                presets_col.label(
+                    text="Add shape keys to this preset.",
+                    icon="INFO",
                 )
 
-            else:
-                owner, ctrl = found
-                control_box.label(
-                    text=f"Control owner: {owner.name}",
-                    icon="SHAPEKEY_DATA",
+            elif found is None and not legacy:
+                recovery_box = presets_col.box()
+                recovery_box.label(
+                    text="Preset control data is unavailable.",
+                    icon="ERROR",
                 )
 
-                users = list(
-                    presets._control_users(owner, ctrl.name)
-                )
+                candidate = presets.preset_control_candidate(gpreset)
 
-                if len(users) > 1:
-                    control_box.label(
-                        text=f"Shared by {len(users)} presets",
+                if candidate is not None:
+                    recovery_box.operator(
+                        "skv.control_restore",
+                        text="Restore Preset Control",
+                    )
+                else:
+                    recovery_box.label(
+                        text="Add an available local object with shape keys.",
                         icon="INFO",
                     )
 
-                row = control_box.row(align=True)
-                row.operator(
-                    "skv.control_move",
-                    text="Move Control",
-                )
-                row.operator(
-                    "skv.control_independent",
-                    text="Make Independent",
-                )
-
-            control_box.operator(
-                "skv.control_migrate",
-                text="Migrate Scene Preset Animation",
-            )
-
             overlaps = presets.preset_overlap_names(scene, gpreset)
             if overlaps:
-                control_box.label(
+                overlap_box = presets_col.box()
+                overlap_box.label(
                     text="Shared shape keys with:",
                     icon="INFO",
                 )
+
                 for name in overlaps:
-                    control_box.label(text=name)
-                control_box.label(
+                    overlap_box.label(text=name)
+
+                overlap_box.label(
                     text="Last applied preset in the list has priority."
                 )
 
