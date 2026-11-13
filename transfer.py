@@ -26,8 +26,8 @@ def _is_valid_mesh_object(obj):
 
 
 def _is_target_data_editable(obj):
-    # Reject linked (library) mesh or shape key datablocks.
-    # Writing into linked data would silently fail or corrupt the library override.
+    # Reject linked mesh or shape key datablocks.
+    # Transfer requires writable local data.
     mesh = obj.data
     if mesh is None:
         return False

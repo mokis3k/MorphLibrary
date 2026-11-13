@@ -365,9 +365,8 @@ def add_shape_key_to_preset(preset, obj, key_name: str):
     it.key_name = key_name
     it.object_open = True
     _set_item_value_from_key_block(it, kb)
-    # [ANIM-FIX] Новое: при добавлении шейпкея в пресет создаём контрол
-    # на шейпкеях первого объекта пресета (если его ещё нет).
-    # Create a control only for a preset that has never had one.
+    # Create a control on the first eligible local shape key datablock.
+    # Do not automatically replace a previously assigned missing control.
     if not preset.control_uid:
         ensure_preset_control(preset)
 
@@ -480,10 +479,9 @@ def global_preset_items_index_update(self, context):
     )
 
 
-# [ANIM-FIX] Новый класс. Анимируемый слайдер пресета, который хранится на
-# шейпкеях объекта: Key.skv_preset_controls[...].value.
-# Поэтому ключи (клавиша I на слайдере) попадают в Shape Key action объекта
-# и переносятся вместе с мешем. name = uid пресета (связь с SKV_GlobalPreset).
+# Store the animatable preset value in Key.skv_preset_controls.
+# Keyframes for this value belong to the shape key datablock's Action.
+# The control name is its identifier, referenced by preset.control_uid.
 class SKV_PresetControl(PropertyGroup):
     value: FloatProperty(
         name="Preset",
@@ -496,8 +494,8 @@ class SKV_PresetControl(PropertyGroup):
 
 class SKV_GlobalPreset(PropertyGroup):
     name: StringProperty(name="Preset Name", default="Preset")
-    # [ANIM-FIX] Новое поле: постоянный ID пресета. По нему контрол на объекте
-    # находит свой пресет (не зависит от порядка и имени пресета).
+    # Identify the preset independently of its name and list position.
+    # The control binding is stored separately in control_owner and control_uid.
     uid: StringProperty(name="Preset ID", default="")
     control_uid: StringProperty(
         name="Control ID",
@@ -1012,9 +1010,9 @@ class SKV_UL_global_presets(UIList):
         row = layout.row(align=True)
 
         row.prop(preset, "name", text="", emboss=False, icon="PRESET")
-        # [ANIM-FIX] Было: row.prop(preset, "value", ...)
-        # Стало: рисуем слайдер контрола на объекте, чтобы ключ (I) писался
-        # в объект, а не в сцену. Если контрола нет — старый слайдер.
+        # Display the scene value while legacy animation is present.
+        # Otherwise, display the control stored on the shape key datablock.
+        # Disable the slider for empty presets or unavailable control data.
         found = find_preset_control(preset)
         legacy = preset_has_legacy_animation(context.scene, preset)
 
@@ -1354,7 +1352,7 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
 
 
 CLASSES = (
-    SKV_PresetControl,  # [ANIM-FIX] новый класс, регистрируется первым
+    SKV_PresetControl, # Register the control property group first.
     SKV_GlobalPresetItem,
     SKV_GlobalPreset,
     SKV_OT_preset_object_transfer,

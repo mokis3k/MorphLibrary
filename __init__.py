@@ -1,6 +1,6 @@
 bl_info = {
     "name": "MorphDeck",
-    "author": "mokis3k",
+    "author": "mokis3k, Bender",
     "version": (1, 0, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > MorphDeck",
@@ -522,10 +522,9 @@ def _depsgraph_update_post(scene, depsgraph):
         _SKV_DEPSGRAPH_GUARD = False
 
 
-# [ANIM-FIX] Новый обработчик смены кадра.
-# Причина бага: F-кривая пишет значение в свойство напрямую и НЕ вызывает
-# update=-колбэк, поэтому анимированный слайдер пресета не двигал шейпкеи.
-# Здесь на каждом кадре анимированные пресеты применяются вручную.
+# Apply animated presets after each frame change.
+# F-Curve evaluation does not invoke property update callbacks,
+# so animated preset values must be applied explicitly.
 @persistent
 def _frame_change_post(scene, depsgraph=None):
     if transfer.is_transfer_running():
@@ -545,7 +544,7 @@ def _ensure_handler_installed():
             handlers.depsgraph_update_post,
             _depsgraph_update_post,
         ),
-        (  # [ANIM-FIX] новая привязка обработчика смены кадра
+        (
             handlers.frame_change_post,
             _frame_change_post,
         ),
@@ -575,7 +574,7 @@ def _ensure_handler_removed():
             handlers.depsgraph_update_post,
             _depsgraph_update_post,
         ),
-        (  # [ANIM-FIX] новая привязка обработчика смены кадра
+        (
             handlers.frame_change_post,
             _frame_change_post,
         ),
@@ -611,7 +610,7 @@ def _ensure_handler_removed():
 
 class SKV_OT_InitializeObject(Operator):
     bl_idname = "skv.initialize_object"
-    bl_label = "Initialize Morph Library"
+    bl_label = "Initialize Shape Keys"
     bl_description = "Create addon groups for this object's shape keys"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1108,8 +1107,8 @@ def _draw_shape_key_sculpt_actions(layout, context, obj, key_data=None):
 
 
 class SKV_PT_ShapeKeysPanel(Panel):
-    bl_label = "Morph Library"
-    bl_idname = "SKV_PT_morph_library_panel"
+    bl_label = "MorphDeck"
+    bl_idname = "SKV_PT_morphdeck_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "MorphDeck"
@@ -1361,7 +1360,7 @@ class SKV_PT_FavoritesPanel(Panel):
             text="Invert",
         ).mode = "INVERT"
 
-        layout.operator(
+        row.operator(
             "skv.favorites_clear",
             text="Clear",
         )
@@ -1940,8 +1939,8 @@ def register():
     bpy.types.Scene.skv_props = PointerProperty(type=SKV_Props)
 
     bpy.types.Scene.skv_global_presets = CollectionProperty(type=presets.SKV_GlobalPreset)
-    # [ANIM-FIX] Новое свойство на шейпкеях (Key): анимируемые слайдеры пресетов.
-    # Раньше анимировался Scene.skv_global_presets[i].value -> ключи шли в сцену.
+    # Store animatable preset controls on shape key datablocks.
+    # Legacy preset values and their animation were stored on the scene.
     bpy.types.Key.skv_preset_controls = CollectionProperty(type=presets.SKV_PresetControl)
     bpy.types.Scene.skv_control_schema_version = IntProperty(
         name="Preset Control Schema Version",
